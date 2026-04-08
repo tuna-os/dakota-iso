@@ -50,22 +50,25 @@ iso-sd-boot target:
     OUTPUT_DIR=$(realpath "{{output_dir}}")
 
     # Export a clean merged rootfs from the installer image.
-    # Set TMPDIR to $HOME so podman export's temp file doesn't land on
-    # /var/tmp where rootless podman can't set SELinux labels (lsetxattr).
+    # Write rootfs tar to $HOME (not output_dir) because podman export
+    # uses filepath.Dir(output) for its temp file, and /var/tmp has a
+    # SELinux context that prevents rootless podman setting container labels.
     echo "Exporting rootfs from localhost/{{target}}-installer..."
+    ROOTFS_TAR="${HOME}/{{target}}-rootfs.tar"
     CID=$(podman create localhost/{{target}}-installer /bin/true)
-    TMPDIR="${HOME}" podman export "${CID}" -o "${OUTPUT_DIR}/{{target}}-rootfs.tar"
+    podman export "${CID}" -o "${ROOTFS_TAR}"
     podman rm "${CID}" >/dev/null
 
     # Run the Debian ISO builder against the exported rootfs tarball
     podman run --rm --privileged \
         -v "${OUTPUT_DIR}:/output:Z" \
+        -v "${ROOTFS_TAR}:/rootfs.tar:ro" \
         localhost/{{target}}-iso-builder \
-        /output/{{target}}-rootfs.tar \
+        /rootfs.tar \
         /output/{{target}}-live.iso
 
     # Clean up the intermediate rootfs tarball
-    rm -f "${OUTPUT_DIR}/{{target}}-rootfs.tar"
+    rm -f "${ROOTFS_TAR}"
     echo "ISO ready: ${OUTPUT_DIR}/{{target}}-live.iso"
 
 iso target:
