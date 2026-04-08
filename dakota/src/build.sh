@@ -26,16 +26,19 @@ fi
 # GNOME OS has no livesys-scripts; create a passwordless live user manually.
 useradd --create-home --uid 1000 --user-group \
     --comment "Live User" liveuser || true
-echo "liveuser:live" | chpasswd
+passwd --delete liveuser
 
-# Enable SSH so the live session is debuggable
-systemctl enable sshd
-# Allow password auth and root-less sudo for liveuser
-cat >> /etc/ssh/sshd_config << 'SSHEOF'
+# Debug builds only: enable SSH so the live session is reachable for testing.
+# Never enabled in production ISOs.
+if [[ "${DEBUG:-0}" == "1" ]]; then
+    echo "liveuser:live" | chpasswd
+    systemctl enable sshd
+    cat >> /etc/ssh/sshd_config << 'SSHEOF'
 PermitEmptyPasswords no
 PasswordAuthentication yes
 SSHEOF
-echo "liveuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/liveuser
+    echo "liveuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/liveuser
+fi
 
 # Skip gnome-initial-setup in the live session so GNOME Shell starts directly
 mkdir -p /home/liveuser/.config

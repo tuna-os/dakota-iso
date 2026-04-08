@@ -5,12 +5,19 @@ image-builder-dev := "image-builder-dev"
 # Override with: just output_dir=/your/path iso-sd-boot dakota
 output_dir := "output"
 
+# Set to 1 to enable SSH in the live session for debugging.
+# Example: just debug=1 output_dir=/tmp/out iso-sd-boot dakota
+# Never use debug=1 for production/release ISOs.
+debug := "0"
+
 # Helper: returns "--bootc-installer-payload-ref <ref>" or "" if no payload_ref file
 _payload_ref_flag target:
     @if [ -f "{{target}}/payload_ref" ]; then echo "--bootc-installer-payload-ref $(cat '{{target}}/payload_ref' | tr -d '[:space:]')"; fi
 
 container target:
-    podman build --cap-add sys_admin --security-opt label=disable -t {{target}}-installer ./{{target}}
+    podman build --cap-add sys_admin --security-opt label=disable \
+        --build-arg DEBUG={{debug}} \
+        -t {{target}}-installer ./{{target}}
 
 # Build the Debian-based ISO assembly container for the given target.
 # This container has xorriso, mksquashfs, dosfstools, and mtools.

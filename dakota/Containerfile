@@ -44,6 +44,11 @@ RUN set -ex; \
 # ── Stage 3: Final Dakota live image ─────────────────────────────────────────
 FROM ghcr.io/projectbluefin/dakota:latest
 
+# Set to "1" via: just debug=1 container dakota (or iso-sd-boot dakota)
+# Enables SSH access in the live session for debugging. Never set in production.
+ARG DEBUG=0
+ENV DEBUG=${DEBUG}
+
 # Replace the OCI-mode initramfs with the dmsquash-live initramfs from stage 2
 COPY --from=initramfs-builder /tmp/initramfs.img /tmp/initramfs.img
 RUN kernel=$(ls /usr/lib/modules | sort -V | tail -1) && \
