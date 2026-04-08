@@ -52,8 +52,8 @@ iso-sd-boot target:
     # Export a clean merged rootfs from the installer image.
     # podman export gives the fully merged OCI layers as a flat tar.
     echo "Exporting rootfs from localhost/{{target}}-installer..."
-    CID=$(podman create localhost/{{target}}-installer /bin/true)
-    podman export "${CID}" -o "${OUTPUT_DIR}/{{target}}-rootfs.tar"
+    CID=$(podman create --security-opt label=disable localhost/{{target}}-installer /bin/true)
+    podman export "${CID}" > "${OUTPUT_DIR}/{{target}}-rootfs.tar"
     podman rm "${CID}" >/dev/null
 
     # Run the Debian ISO builder against the exported rootfs tarball
