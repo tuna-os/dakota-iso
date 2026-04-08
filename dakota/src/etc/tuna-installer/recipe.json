@@ -1,0 +1,11 @@
+{
+  "image": "ghcr.io/projectbluefin/dakota:latest",
+  "targetImgref": "ghcr.io/projectbluefin/dakota:latest",
+  "composeFsBackend": true,
+  "bootloader": "systemd",
+  "filesystem": "btrfs",
+  "btrfsSubvolumes": false,
+  "selinuxDisabled": false,
+  "unifiedStorage": true,
+  "hostname": "bluefin"
+}

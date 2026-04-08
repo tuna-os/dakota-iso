@@ -1,0 +1,21 @@
+{
+  "default_image": "ghcr.io/projectbluefin/dakota:latest",
+  "fallback_flatpaks": [],
+  "images": [
+    {
+      "name": "Bluefin",
+      "needs_user_creation": false,
+      "composefs": true,
+      "bootloader": "systemd",
+      "filesystem": "btrfs",
+      "flatpaks": "https://raw.githubusercontent.com/projectbluefin/common/refs/heads/main/system_files/bluefin/usr/share/ublue-os/homebrew/system-flatpaks.Brewfile",
+      "children": [
+        {
+          "name": "Dakota",
+          "imgref": "ghcr.io/projectbluefin/dakota:latest",
+          "desc": "GNOME OS-based Bluefin. Composefs backend, systemd-boot."
+        }
+      ]
+    }
+  ]
+}

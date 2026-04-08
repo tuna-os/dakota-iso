@@ -8,6 +8,50 @@ _payload_ref_flag target:
 container target:
     podman build --cap-add sys_admin --security-opt label=disable -t {{target}}-installer ./{{target}}
 
+# Build the Debian-based ISO assembly container for the given target.
+# This container has xorriso, mksquashfs, dosfstools, and mtools.
+iso-builder target:
+    podman build --security-opt label=disable -t {{target}}-iso-builder \
+        -f ./{{target}}/Containerfile.builder ./{{target}}
+
+# Build a systemd-boot UEFI live ISO for the given target.
+#
+# Uses a two-container approach:
+#   1. localhost/<target>-installer — the live environment (3-stage Containerfile)
+#   2. localhost/<target>-iso-builder — Debian ISO assembly tools (Containerfile.builder)
+#
+# The installer image is exported as a clean rootfs tarball via `podman export`,
+# then the ISO builder creates:
+#   - A FAT ESP image with systemd-boot + loader entries + kernel + initramfs
+#   - A squashfs of the full live rootfs
+#   - An ISO9660 image with El Torito EFI pointing to the FAT ESP
+#
+# Output: output/<target>-live.iso
+iso-sd-boot target:
+    #!/usr/bin/bash
+    set -euo pipefail
+    just container {{target}}
+    just iso-builder {{target}}
+    mkdir -p output
+
+    # Export a clean merged rootfs from the installer image.
+    # podman export gives the fully merged OCI layers as a flat tar.
+    echo "Exporting rootfs from localhost/{{target}}-installer..."
+    CID=$(podman create localhost/{{target}}-installer /bin/true)
+    podman export "${CID}" -o output/{{target}}-rootfs.tar
+    podman rm "${CID}" >/dev/null
+
+    # Run the Debian ISO builder against the exported rootfs tarball
+    podman run --rm --privileged \
+        -v "${PWD}/output:/output:Z" \
+        localhost/{{target}}-iso-builder \
+        /output/{{target}}-rootfs.tar \
+        /output/{{target}}-live.iso
+
+    # Clean up the intermediate rootfs tarball
+    rm -f output/{{target}}-rootfs.tar
+    echo "ISO ready: output/{{target}}-live.iso"
+
 iso target:
     {{image-builder}} build --bootc-ref localhost/{{target}}-installer --bootc-default-fs ext4 `just _payload_ref_flag {{target}}` bootc-generic-iso
 
@@ -113,3 +157,62 @@ dev target:
     just build-image-builder
     just iso-in-container {{target}}
     just run-iso {{target}}
+
+# Boot a built ISO in QEMU via UEFI (OVMF) with serial console output on stdout.
+#
+# Validation target: watch serial output for "Started GNOME Display Manager"
+# or "gnome-shell" to confirm the live environment reached the desktop.
+#
+# Requires: qemu-system-x86_64, KVM, OVMF firmware (edk2-ovmf / ovmf package)
+# Exit: Ctrl-A then X
+boot-iso-serial target:
+    #!/usr/bin/bash
+    set -euo pipefail
+    ISO=$(ls \
+        output/{{target}}-live.iso \
+        output/bootiso/install.iso \
+        output/bootc-{{target}}*.iso \
+        2>/dev/null | head -1)
+    if [[ -z "$ISO" ]]; then
+        echo "No ISO found for '{{target}}' — run: just iso-sd-boot {{target}}" >&2
+        exit 1
+    fi
+
+    # Locate OVMF firmware (path varies by distro)
+    OVMF_CODE=""
+    for f in \
+        /usr/share/OVMF/OVMF_CODE.fd \
+        /usr/share/edk2/ovmf/OVMF_CODE.fd \
+        /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
+        /usr/share/ovmf/OVMF.fd; do
+        [[ -f "$f" ]] && { OVMF_CODE="$f"; break; }
+    done
+    OVMF_VARS_SRC=""
+    for f in \
+        /usr/share/OVMF/OVMF_VARS.fd \
+        /usr/share/edk2/ovmf/OVMF_VARS.fd \
+        /usr/share/edk2-ovmf/x64/OVMF_VARS.fd; do
+        [[ -f "$f" ]] && { OVMF_VARS_SRC="$f"; break; }
+    done
+    if [[ -z "$OVMF_CODE" ]]; then
+        echo "OVMF firmware not found — install edk2-ovmf or ovmf" >&2
+        exit 1
+    fi
+
+    # OVMF_VARS must be writable (UEFI saves boot state to it)
+    OVMF_VARS=$(mktemp /tmp/OVMF_VARS.XXXXXX.fd)
+    [[ -n "$OVMF_VARS_SRC" ]] && cp "${OVMF_VARS_SRC}" "${OVMF_VARS}"
+    trap "rm -f ${OVMF_VARS}" EXIT
+
+    echo "Booting ${ISO} via UEFI — serial console below (Ctrl-A X to quit)"
+    qemu-system-x86_64 \
+        -m 4096 \
+        -accel kvm \
+        -cpu host \
+        -smp 4 \
+        -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
+        -drive if=pflash,format=raw,file="${OVMF_VARS}" \
+        -cdrom "${ISO}" \
+        -nographic \
+        -serial mon:stdio \
+        -no-reboot

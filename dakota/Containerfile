@@ -1,0 +1,54 @@
+# Dakota live ISO installer image
+#
+# Build with:
+#   just container dakota
+#
+# Three-stage build:
+#   1. dakota-ref   — original Dakota image (provides kernel modules)
+#   2. initramfs-builder — Debian: builds a dmsquash-live initramfs against
+#                          Dakota's kernel modules in its native glibc environment
+#   3. final        — Dakota: receives the rebuilt initramfs + live-env setup
+#
+# Dakota is GNOME OS / freedesktop-sdk based — no package manager, no dracut.
+# The initramfs is built in a separate Debian stage so no cross-distro binary
+# grafting is needed; only the initramfs.img output crosses the stage boundary.
+# The ISO bootloader is systemd-boot (already in Dakota at
+# /usr/lib/systemd/boot/efi/systemd-bootx64.efi) — no GRUB2 or shim required.
+
+# ── Stage 1: Dakota reference (kernel modules source) ────────────────────────
+FROM ghcr.io/projectbluefin/dakota:latest AS dakota-ref
+
+# ── Stage 2: Debian — builds the dmsquash-live initramfs ─────────────────────
+# Dracut runs natively in Debian against Dakota's kernel modules.
+# Only /tmp/initramfs.img crosses into the final stage.
+FROM debian:sid AS initramfs-builder
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        dracut \
+        dmsetup \
+    && rm -rf /var/lib/apt/lists/*
+
+# Import Dakota's kernel module tree so dracut targets the correct kernel
+COPY --from=dakota-ref /usr/lib/modules /usr/lib/modules
+
+RUN set -ex; \
+    kernel=$(ls /usr/lib/modules | sort -V | tail -1); \
+    echo "Building dmsquash-live initramfs for kernel ${kernel}"; \
+    DRACUT_NO_XATTR=1 dracut -v --force --zstd --reproducible --no-hostonly \
+        --add "dmsquash-live dmsquash-live-autooverlay" \
+        --add-drivers "squashfs overlay loop iso9660 sr_mod cdrom" \
+        /tmp/initramfs.img "${kernel}"; \
+    ls -lh /tmp/initramfs.img
+
+# ── Stage 3: Final Dakota live image ─────────────────────────────────────────
+FROM ghcr.io/projectbluefin/dakota:latest
+
+# Replace the OCI-mode initramfs with the dmsquash-live initramfs from stage 2
+COPY --from=initramfs-builder /tmp/initramfs.img /tmp/initramfs.img
+RUN kernel=$(ls /usr/lib/modules | sort -V | tail -1) && \
+    mv /tmp/initramfs.img "/usr/lib/modules/${kernel}/initramfs.img" && \
+    echo "Replaced initramfs for kernel ${kernel}"
+
+# Apply live-environment setup: liveuser, GDM autologin, tuna-installer config
+RUN --mount=type=bind,source=src,target=/src /src/build.sh
