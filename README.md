@@ -1,68 +1,157 @@
-# Container image based ISOs
+# Dakota Live ISO
 
-This is an experiment showcasing building bootable ISO images from a container image. Building such an ISO is a 2-step process:
+Builds a bootable UEFI live ISO from the [Dakota](https://github.com/projectbluefin/dakota) image — a GNOME OS-based workstation using composefs and systemd-boot. The live environment boots straight to GDM with a full GNOME session and launches the Dakota installer automatically.
 
-1) Building a container image that fulfills the required contract (more on that later)
-2) Converting such an image to an ISO via [image-builder](https://github.com/osbuild/image-builder-cli) and the `bootc-generic-iso` type
+## How it works
 
-## Design decisions
+The build uses two Podman containers:
 
-- The ISO uses El Torito configuration, shim, and GRUB2 configured to maximize compatibility. I.e., it is supposed to boot on all combinations of UEFI/legacy and CD/USB.
-- Shim, GRUB2 and its configuration, kernel, and initramfs come from well-specified paths in the container.
-- The ISO embeds the container converted to a squashfs archive.
-- The user is responsible for configuring GRUB2, kernel, and initramfs so they can load the squashfs.
+1. **`dakota-installer`** — a multi-stage container that pulls the Dakota base image, creates a live user, configures GDM autologin, installs Flatpaks from Flathub, and drops in the installer config.
+2. **`dakota-iso-builder`** — a Debian-based toolchain container (xorriso, mksquashfs, dosfstools, mtools) that assembles the final ISO from the exported rootfs.
 
-## Container-native ISO contract v0.1.0
-This spec is inspired by the layout of Fedora bootc images and Fedora live ISO images.
+The ISO layout:
+- **EFI/efi.img** — FAT32 ESP with systemd-boot, kernel, and initramfs
+- **LiveOS/squashfs.img** — squashfs of the full live rootfs
+- **El Torito** UEFI entry (no-emulation mode) pointing to the ESP image
 
-- The kernel is expected to be in `/usr/lib/module/*/vmlinuz`. If there are multiple kernels, the behavior is unspecified. This is to be specified in a future version of this contract. The kernel is put in `/images/pxeboot/vmlinuz` in the ISO.
-- The initramfs is expected to be next to the kernel with the filename `initramfs.img`. The initramfs is put in `/images/pxeboot/initrd.img`.
-- The UEFI vendor is specified by a directory name in `/usr/lib/efi/shim/*/EFI/$VENDOR`. If there are multiple directories, the behaviour is unspecified. The `BOOT` directory is always ignored.
-- Shim and grub2 EFI binaries (`shimx64.efi`, `mmx64.efi`, `gcdx64.efi`) are expected to be in `/boot/efi/EFI/$VENDOR`.
-- GRUB2 modules are expected to be in `/usr/lib/grub/i386-pc`.
-- Required executables are `podman`, `mksquashfs`, `xorriso`, `implantisomd5`, `grub2-mkimage`, and `python`.
-- The container image is converted to a squashfs archive and put into `/LiveOS/squashfs.img` in the ISO.
-- Additional configuration can be written into `/usr/lib/bootc-image-builder/iso.yaml` in YAML format. The file currently supports 2 top-level keys:
-  - `label` (string): Label of the ISO
-  - `grub2` (object): GRUB2 configuration, supports the following keys:
-    - `default` (string): Default menu item
-    - `timeout` (string): Default timeout (in seconds)
-    - `entries` (array of objects): GRUB2 menu entries with the following keys (all are required):
-      - `name` (string): Name of the entry
-      - `linux` (string): Path to the kernel + kernel arguments (the path is always `/images/pxeboot/vmlinuz` in this version of this spec)
-      - `initrd` (string): Path to the initramfs (the path is always `/images/pxeboot/initrd.img` in this version of this spec)
-- The `--bootc-installer-payload-ref` argument to `image-builder` can optionally be used to copy a container image from the host's container storage to `/var/lib/containers/storage` in the squashfs archive.
+At boot, `dmsquash-live` mounts the squashfs and creates an overlayfs so the live environment is fully writable.
 
-## Example ISOs
-This repository contains the following example ISOs:
+## Requirements
 
-- `bazzite` - Clone of the Bazzite Live ISO but built using this contract and `image-builder`. Contains a KDE environment with flatpaks, and an offline installer.
-- `kinoite` - Live environment of Fedora Kinoite (Fedora with KDE)
-- `bluefin-lts` - Live environment of Bluefin LTS (CentOS Stream 10 + GNOME)
-- `debian` - Tiny Debian text environment, log in with `liveuser`
-- `ubuntu` - Tiny Ubuntu text environment, log in with `liveuser`
-- `fedora-payload` - Minimal text-based Fedora bootc online installer.
+| Tool | Notes |
+|---|---|
+| `podman` | Rootless works; needs `--cap-add sys_admin` for the live env build |
+| `just` | Task runner — `cargo install just` or distro package |
+| KVM + `qemu-system-x86_64` | For local boot testing only |
+| OVMF firmware | `edk2-ovmf` (Fedora/RHEL) or `ovmf` (Debian/Ubuntu) |
 
-## Building ISOs
-Build the container:
+**Disk space:** The build needs ~22 GB free:
+- ~12 GB for the rootfs tarball (Flatpak-heavy)
+- ~5 GB for the squashfs
+- ~5 GB for the final ISO
 
-```
-sudo just container <CONTAINER>
+By default, output goes to `./output/`. If `/tmp` is a small tmpfs on your machine, override with `just output_dir=/path/with/space iso-sd-boot dakota`.
+
+## Building
+
+```bash
+# Clone the repo
+git clone https://github.com/hanthor/dakota-iso
+cd dakota-iso
+
+# Full build — live env container + ISO assembly
+just iso-sd-boot dakota
+
+# Override output directory (if ./output/ is on a small filesystem)
+just output_dir=/var/data/iso-output iso-sd-boot dakota
 ```
 
-Then build the ISO:
+The build takes **20–40 minutes** depending on your internet connection — the Flatpak install step downloads ~2 GB from Flathub.
+
+Output: `output/dakota-live.iso` (~4.5 GB)
+
+### Build stages
 
 ```
-sudo just iso <CONTAINER>
+just container dakota          # Build the live environment container
+just iso-builder dakota        # Build the ISO assembly toolchain container
+just iso-sd-boot dakota        # Full end-to-end build (runs both above + assembles ISO)
 ```
 
-Since you need a fairly new version (TBD) of `image-builder`, I recommend using a containerized version of `image-builder` with all patches required for this spec ready:
+## Testing
 
-```
-sudo just build-image-builder iso-in-container <CONTAINER>
+### Serial console (headless, CI-friendly)
+
+Boots the ISO in QEMU with serial console output. Watch for `Started gdm.service` to confirm the live environment reached GDM.
+
+```bash
+just boot-iso-serial dakota
+# Exit: Ctrl-A then X
 ```
 
-## Quirks
-- Due to an issue in `image-builder`, `/etc/os-release` in the container must contain `VERSION_ID`. Its value is currently unused, though.
-- The squashfs is currently not SELinux-labeled. This will be fixed and configurable in the next version of the spec.
-- The spec should live in `osbuild/image-builder-cli`.
+### With a graphical display (VNC)
+
+```bash
+qemu-system-x86_64 \
+  -m 4096 -accel kvm -cpu host -smp 4 \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,file=/tmp/ovmf-vars.fd \
+  -cdrom output/dakota-live.iso \
+  -vnc 127.0.0.1:0
+# Connect your VNC client to localhost:5900
+```
+
+### In libvirt / virt-manager
+
+```bash
+# Copy ISO to libvirt images pool
+sudo cp output/dakota-live.iso /var/lib/libvirt/images/dakota-live.iso
+
+# Create a VM with UEFI firmware (TPM disabled — swtpm not required)
+sudo virt-install \
+  --name dakota-live \
+  --memory 4096 --vcpus 4 \
+  --boot loader=/usr/share/edk2/ovmf/OVMF_CODE.fd,loader.readonly=yes,loader.type=pflash,nvram.template=/usr/share/edk2/ovmf/OVMF_VARS.fd \
+  --cdrom /var/lib/libvirt/images/dakota-live.iso \
+  --disk size=50,format=qcow2 \
+  --graphics vnc,listen=127.0.0.1 \
+  --os-variant generic \
+  --tpm none \
+  --noautoconsole
+
+# Get the VNC port and connect
+virsh domdisplay dakota-live
+# Connect to vnc://127.0.0.1:0  (port 5900)
+```
+
+## Installer configuration
+
+The installer is pre-configured to install Dakota only. Configuration lives in `dakota/src/etc/bootc-installer/`:
+
+| File | Purpose |
+|---|---|
+| `images.json` | Locks the image catalog to Dakota — the installer shows only one choice |
+| `recipe.json` | Sets distro branding (`distro_name`, `distro_logo`), tour slides, and install steps |
+
+Both files are read by `org.bootcinstaller.Installer` from `/etc/bootc-installer/` at runtime.
+
+### `images.json` — catalog entry
+
+```json
+{
+  "name": "Dakota",
+  "imgref": "ghcr.io/projectbluefin/dakota:latest",
+  "bootloader": "systemd",
+  "filesystem": "btrfs",
+  "composefs": true,
+  "needs_user_creation": false,
+  "flatpak_var_path": "state/os/default/var"
+}
+```
+
+Key fields for Dakota:
+- `bootloader: "systemd"` — installs systemd-boot, not GRUB
+- `composefs: true` — enables composefs backend
+- `flatpak_var_path` — where the installer places Flatpak data on the installed system
+- `needs_user_creation: false` — GNOME Initial Setup handles user creation on first boot
+
+## Troubleshooting
+
+**ISO fails to boot (UEFI says "no bootable device" or CDROM code 0009)**
+The El Torito entry must be in no-emulation mode. This is set by `-no-emul-boot` in the xorriso command in `build-iso.sh`. Do not remove it.
+
+**Flatpak build fails with `O_TMPFILE` error**
+This happens when building inside a container on an overlayfs mount. The fix (`export TMPDIR=/dev/shm`) is already in `build.sh` — `/dev/shm` is always a real tmpfs that supports `O_TMPFILE`.
+
+**Build runs out of disk space**
+The default `./output/` directory needs ~22 GB free. If `/tmp` or your home directory is on a small filesystem, use a larger path:
+```bash
+just output_dir=/var/data/iso-output iso-sd-boot dakota
+```
+
+**`openh264` warning during Flatpak install**
+```
+Warning: Failed to install org.freedesktop.Platform.openh264
+```
+This is harmless — `openh264` requires user namespaces which aren't available inside Podman builds. The ISO functions correctly without it.
+

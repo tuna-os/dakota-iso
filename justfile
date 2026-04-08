@@ -1,6 +1,10 @@
 image-builder := "image-builder"
 image-builder-dev := "image-builder-dev"
 
+# Output directory for built ISOs and intermediate artifacts.
+# Override with: just output_dir=/your/path iso-sd-boot dakota
+output_dir := "output"
+
 # Helper: returns "--bootc-installer-payload-ref <ref>" or "" if no payload_ref file
 _payload_ref_flag target:
     @if [ -f "{{target}}/payload_ref" ]; then echo "--bootc-installer-payload-ref $(cat '{{target}}/payload_ref' | tr -d '[:space:]')"; fi
@@ -32,25 +36,25 @@ iso-sd-boot target:
     set -euo pipefail
     just container {{target}}
     just iso-builder {{target}}
-    mkdir -p /var/home/james/dakota-iso-output
+    mkdir -p {{output_dir}}
 
     # Export a clean merged rootfs from the installer image.
     # podman export gives the fully merged OCI layers as a flat tar.
     echo "Exporting rootfs from localhost/{{target}}-installer..."
     CID=$(podman create localhost/{{target}}-installer /bin/true)
-    podman export "${CID}" -o /var/home/james/dakota-iso-output/{{target}}-rootfs.tar
+    podman export "${CID}" -o {{output_dir}}/{{target}}-rootfs.tar
     podman rm "${CID}" >/dev/null
 
     # Run the Debian ISO builder against the exported rootfs tarball
     podman run --rm --privileged \
-        -v "/var/home/james/dakota-iso-output:/output:Z" \
+        -v "{{output_dir}}:/output:Z" \
         localhost/{{target}}-iso-builder \
         /output/{{target}}-rootfs.tar \
         /output/{{target}}-live.iso
 
     # Clean up the intermediate rootfs tarball
-    rm -f /var/home/james/dakota-iso-output/{{target}}-rootfs.tar
-    echo "ISO ready: /var/home/james/dakota-iso-output/{{target}}-live.iso"
+    rm -f {{output_dir}}/{{target}}-rootfs.tar
+    echo "ISO ready: {{output_dir}}/{{target}}-live.iso"
 
 iso target:
     {{image-builder}} build --bootc-ref localhost/{{target}}-installer --bootc-default-fs ext4 `just _payload_ref_flag {{target}}` bootc-generic-iso
@@ -169,7 +173,7 @@ boot-iso-serial target:
     #!/usr/bin/bash
     set -euo pipefail
     ISO=$(ls \
-        /var/home/james/dakota-iso-output/{{target}}-live.iso \
+        {{output_dir}}/{{target}}-live.iso \
         output/bootiso/install.iso \
         output/bootc-{{target}}*.iso \
         2>/dev/null | head -1 || true)
