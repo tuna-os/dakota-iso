@@ -32,11 +32,21 @@ passwd --delete liveuser
 # Never enabled in production ISOs.
 if [[ "${DEBUG:-0}" == "1" ]]; then
     echo "liveuser:live" | chpasswd
-    usermod -aG wheel liveuser
-    # systemctl enable doesn't work in a container build; create the symlink directly
+
+    # Grant passwordless sudo via sudoers drop-in (usermod -aG wheel doesn't
+    # persist reliably through the squashfs overlay at runtime).
+    echo "liveuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/liveuser
+    chmod 440 /etc/sudoers.d/liveuser
+
+    # Enable sshd: the Dakota/Bluefin preset marks sshd disabled, so a plain
+    # wants symlink gets overridden at first boot.  A preset file in
+    # /etc/systemd/system-preset/ takes priority over /usr/lib and forces it on.
+    mkdir -p /etc/systemd/system-preset
+    echo "enable sshd.service" > /etc/systemd/system-preset/90-live-debug.preset
     mkdir -p /etc/systemd/system/multi-user.target.wants
     ln -sf /usr/lib/systemd/system/sshd.service \
         /etc/systemd/system/multi-user.target.wants/sshd.service
+
     cat >> /etc/ssh/sshd_config << 'SSHEOF'
 PermitEmptyPasswords no
 PasswordAuthentication yes
