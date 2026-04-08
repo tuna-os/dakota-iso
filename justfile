@@ -50,11 +50,12 @@ iso-sd-boot target:
     OUTPUT_DIR=$(realpath "{{output_dir}}")
 
     # Export a clean merged rootfs from the installer image.
-    # podman export gives the fully merged OCI layers as a flat tar.
+    # Use 'podman image mount' + tar to avoid podman export's TMPDIR usage
+    # which fails with SELinux lsetxattr on /var/tmp in rootless mode.
     echo "Exporting rootfs from localhost/{{target}}-installer..."
-    CID=$(podman create --security-opt label=disable localhost/{{target}}-installer /bin/true)
-    podman export "${CID}" > "${OUTPUT_DIR}/{{target}}-rootfs.tar"
-    podman rm "${CID}" >/dev/null
+    MOUNT_PATH=$(podman image mount localhost/{{target}}-installer)
+    tar -C "${MOUNT_PATH}" -cf "${OUTPUT_DIR}/{{target}}-rootfs.tar" .
+    podman image unmount localhost/{{target}}-installer >/dev/null
 
     # Run the Debian ISO builder against the exported rootfs tarball
     podman run --rm --privileged \
