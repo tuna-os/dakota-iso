@@ -36,8 +36,8 @@ flatpak override --system --filesystem=/etc:ro org.bootcinstaller.Installer
 readarray -t WANTED < <(grep -v '^[[:space:]]*#' /tmp/flatpaks-list | grep -v '^[[:space:]]*$')
 
 # Install or update everything in the list (--or-update = skip if current)
-# --no-related-refs skips locale packs and debug symbols (~3 GB uncompressed)
-flatpak install --system --noninteractive --no-related-refs --or-update flathub "${WANTED[@]}"
+# --no-related skips locale packs and debug symbols (~3 GB uncompressed)
+flatpak install --system --noninteractive --no-related --or-update flathub "${WANTED[@]}"
 
 # Remove any system app that is no longer in the wanted list
 readarray -t INSTALLED < <(flatpak list --app --system --columns=application 2>/dev/null || true)
