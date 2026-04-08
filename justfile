@@ -65,11 +65,10 @@ iso-sd-boot target:
     # Run build-iso.sh directly on the host — no container needed.
     # All required tools (xorriso, mksquashfs, mkfs.fat, mtools) are present.
     # TMPDIR is redirected to OUTPUT_DIR so mktemp avoids the full /tmp tmpfs.
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    BUILD_ISO="${SCRIPT_DIR}/{{target}}/src/build-iso.sh"
+    # just always runs recipes from the justfile directory, so relative path works.
     TMPDIR="${OUTPUT_DIR}" \
     PATH="/usr/sbin:/usr/bin:/home/linuxbrew/.linuxbrew/bin:${PATH}" \
-        bash "${BUILD_ISO}" "${ROOTFS_TAR}" "${OUTPUT_DIR}/{{target}}-live.iso"
+        bash "{{target}}/src/build-iso.sh" "${ROOTFS_TAR}" "${OUTPUT_DIR}/{{target}}-live.iso"
 
     echo "ISO ready: ${OUTPUT_DIR}/{{target}}-live.iso"
 
