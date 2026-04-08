@@ -213,6 +213,6 @@ boot-iso-serial target:
         -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
         -drive if=pflash,format=raw,file="${OVMF_VARS}" \
         -cdrom "${ISO}" \
-        -nographic \
+        -display none \
         -serial mon:stdio \
         -no-reboot
