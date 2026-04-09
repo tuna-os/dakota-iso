@@ -117,6 +117,7 @@ mkdir -p /etc/dconf/db/local.d
 cat > /etc/dconf/db/local.d/00-live-iso << 'DCONFEOF'
 [org/gnome/shell]
 welcome-dialog-last-shown-version='999'
+favorite-apps=['dakota-installer.desktop', 'org.mozilla.firefox.desktop', 'org.gnome.Nautilus.desktop', 'org.gnome.Console.desktop']
 
 [org/gnome/desktop/screensaver]
 lock-enabled=false
@@ -131,6 +132,7 @@ cat > /etc/dconf/db/local.d/locks/live-iso << 'LOCKSEOF'
 /org/gnome/desktop/screensaver/lock-enabled
 /org/gnome/desktop/screensaver/idle-activation-enabled
 /org/gnome/desktop/session/idle-delay
+/org/gnome/shell/favorite-apps
 LOCKSEOF
 
 dconf update
@@ -203,9 +205,24 @@ cat > /etc/xdg/autostart/tuna-installer.desktop << DTEOF
 [Desktop Entry]
 Name=Dakota Installer
 Exec=flatpak run --env=VANILLA_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
-Icon=/usr/share/pixmaps/dakota.png
+Icon=dakota
 Type=Application
 X-GNOME-Autostart-enabled=true
+DTEOF
+
+# A matching entry in /usr/share/applications/ lets GNOME Shell reference this
+# app in the dock via favorite-apps. The autostart file auto-launches it; this
+# entry makes it visible and pinnable as 'dakota-installer.desktop'.
+mkdir -p /usr/share/applications
+cat > /usr/share/applications/dakota-installer.desktop << DTEOF
+[Desktop Entry]
+Name=Dakota Installer
+Comment=Install Dakota to your computer
+Exec=flatpak run --env=VANILLA_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
+Icon=dakota
+Type=Application
+Categories=System;
+NoDisplay=false
 DTEOF
 
 # ── Polkit rules for live installer (tuna-os/tuna-installer#25) ───────────────
