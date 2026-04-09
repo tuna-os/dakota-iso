@@ -2,6 +2,20 @@
 
 ## Local build setup
 
+### ⚠️ Background builds — use setsid + disown
+
+Running the build as a plain background job (`&`) will get killed by SIGHUP
+when the shell session ends. Always detach it fully:
+
+```bash
+cd /var/home/james/dev/dakota-iso
+setsid sudo just installer_channel=dev output_dir=output iso-sd-boot dakota \
+    > output/build.log 2>&1 &
+disown $!
+# Watch progress:
+tail -f output/build.log
+```
+
 ### ⚠️ Never build from /tmp
 
 `/tmp` is a tmpfs with only ~16 GB. The build needs ~30 GB of intermediate space
