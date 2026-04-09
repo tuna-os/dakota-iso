@@ -59,8 +59,17 @@ iso-sd-boot target:
     mkdir -p {{output_dir}}
     OUTPUT_DIR=$(realpath "{{output_dir}}")
 
-    # Build squashfs and export boot files using podman unshare (user namespace).
-    #
+    # podman unshare enters the user namespace so rootless podman's sub-uid mapped
+    # files are accessible/removable.  When running as root (e.g. CI with sudo),
+    # there is no user namespace to enter — run commands directly instead.
+    if [[ $(id -u) -eq 0 ]]; then
+        _ns()    { bash -c "$1"; }
+        _ns_rm() { rm -rf "$@"; }
+    else
+        _ns()    { podman unshare bash -c "$1"; }
+        _ns_rm() { podman unshare rm -rf "$@"; }
+    fi
+
     # The OCI payload (for offline install) is built into a staging directory on
     # /var (plenty of space) rather than inside the container's writable layer.
     # mksquashfs merges the image rootfs + staging dir, deduplicating blocks that
@@ -70,10 +79,10 @@ iso-sd-boot target:
     BOOT_TAR="${OUTPUT_DIR}/{{target}}-boot-files.tar"
     CS_STAGING="${OUTPUT_DIR}/{{target}}-cs-staging"
     SQUASHFS_ROOT="${OUTPUT_DIR}/{{target}}-sfs-root"
-    # CS_STAGING and SQUASHFS_ROOT contain sub-uid owned files; must be removed inside podman unshare.
-    trap "rm -f '${SQUASHFS}' '${BOOT_TAR}' '${OUTPUT_DIR}/{{target}}-payload.oci.tar'; podman unshare rm -rf '${CS_STAGING}' '${SQUASHFS_ROOT}' 2>/dev/null || true" EXIT
+    # CS_STAGING and SQUASHFS_ROOT contain sub-uid owned files; must be removed inside the namespace.
+    trap "rm -f '${SQUASHFS}' '${BOOT_TAR}' '${OUTPUT_DIR}/{{target}}-payload.oci.tar'; _ns_rm '${CS_STAGING}' '${SQUASHFS_ROOT}' 2>/dev/null || true" EXIT
     echo "Building squashfs and boot tar from localhost/{{target}}-installer..."
-    podman unshare bash -c "
+    _ns "
         set -euo pipefail
         MOUNT=\$(podman image mount localhost/{{target}}-installer)
         PATH=/usr/sbin:/usr/bin:/home/linuxbrew/.linuxbrew/bin:\$PATH
