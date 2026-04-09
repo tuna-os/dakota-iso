@@ -114,6 +114,23 @@ chown -R liveuser:liveuser /home/liveuser/.config
 # the welcome-dialog-last-shown-version=999 key below.
 rm -f /usr/share/applications/org.gnome.Tour.desktop
 
+# Override the tuna-installer flatpak's desktop entry so it appears as
+# "Dakota Installer" with the dakota icon instead of "bootc Installer (Devel)".
+# /usr/local/share/applications/ is earlier in XDG_DATA_DIRS than the flatpak
+# export path, so this file takes precedence without modifying the flatpak.
+mkdir -p /usr/local/share/applications
+cat > /usr/local/share/applications/org.bootcinstaller.Installer.Devel.desktop << 'DESKTOPEOF'
+[Desktop Entry]
+Name=Dakota Installer
+Exec=/usr/bin/flatpak run --branch=master --arch=x86_64 --command=bootc-installer org.bootcinstaller.Installer.Devel
+Icon=dakota
+Terminal=false
+Type=Application
+Categories=GTK;System;Settings;
+StartupNotify=true
+X-Flatpak=org.bootcinstaller.Installer.Devel
+DESKTOPEOF
+
 # Suppress the GNOME Tour / "Welcome to Bluefin" dialog on first login.
 # GNOME Shell shows it whenever welcome-dialog-last-shown-version < current
 # shell version.  Setting it to 999 via a system dconf policy ensures it is
