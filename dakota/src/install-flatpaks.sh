@@ -14,8 +14,12 @@ set -exo pipefail
 
 FLATPAK_CACHE="/var/cache/flatpak-dl"
 
-# overlayfs inside Podman builds doesn't support O_TMPFILE; /dev/shm does.
-export TMPDIR=/dev/shm
+# overlayfs inside Podman builds doesn't support O_TMPFILE.  /dev/shm would
+# work but is only ~3.5 GB on GHA 7-GB runners — too small for GNOME Platform.
+# The --mount=type=cache volume is a bind-mount from btrfs (supports O_TMPFILE)
+# and has ~60 GB free, so use a subdirectory of it as TMPDIR instead.
+mkdir -p "${FLATPAK_CACHE}/tmp"
+export TMPDIR="${FLATPAK_CACHE}/tmp"
 mkdir -p /run/dbus
 dbus-daemon --system --fork --nopidfile
 sleep 1
