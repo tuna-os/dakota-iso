@@ -200,21 +200,56 @@ DTEOF
 
 # ── Polkit rules for live installer (tuna-os/tuna-installer#25) ───────────────
 # The installer's polkit action (org.tunaos.Installer.install) defaults to
-# auth_admin, which blocks installation because liveuser is not an admin.
-# Also, the Flatpak does not export its polkit policy file or the fisherman
-# binary to the host, so we set those up here as a workaround.
+# auth_admin.  On the live ISO we want liveuser to install without any password
+# prompt.  Two complementary mechanisms are used for belt-and-suspenders:
+#
+#  1. Policy override: write the action definition directly with allow_active=yes
+#     so polkit approves it at the policy level before rules even run.
+#
+#  2. JS rule: belt-and-suspenders fallback that grants YES for liveuser.
+#     Omitting subject.active so GDM autologin sessions (which may not always
+#     be marked active by logind) are also covered.
+#
+# The Flatpak does not export its policy file or fisherman to the host, so both
+# are set up manually here.
+
+# fisherman symlink — installer calls /usr/local/bin/fisherman via pkexec
 INSTALLER_APP_DIR=$(find /var/lib/flatpak/app/${INSTALLER_APP_ID} -name fisherman -type f 2>/dev/null | head -1 | xargs dirname 2>/dev/null || true)
 if [ -n "$INSTALLER_APP_DIR" ]; then
     mkdir -p /usr/local/bin
     ln -sf "${INSTALLER_APP_DIR}/fisherman" /usr/local/bin/fisherman
-    POLICY_FILE=$(find /var/lib/flatpak/app/${INSTALLER_APP_ID} -name 'org.bootcinstaller.Installer.policy' 2>/dev/null | head -1)
-    [ -n "$POLICY_FILE" ] && install -Dm644 "$POLICY_FILE" /usr/share/polkit-1/actions/org.bootcinstaller.Installer.policy
 fi
+
+# Policy file: write it directly so we're not dependent on Flatpak search.
+# allow_active=yes means any active session can run the installer without auth.
+mkdir -p /usr/share/polkit-1/actions
+cat > /usr/share/polkit-1/actions/org.bootcinstaller.Installer.policy << 'POLICYEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="org.tunaos.Installer.install">
+    <description>Install an operating system to disk</description>
+    <message>Authentication is required to install an operating system</message>
+    <icon_name>drive-harddisk</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/fisherman</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>
+POLICYEOF
+
+# JS rule fallback: covers edge cases where the session is not yet marked active
 mkdir -p /etc/polkit-1/rules.d
 cat > /etc/polkit-1/rules.d/99-live-installer.rules << 'EOF'
 polkit.addRule(function(action, subject) {
     if (action.id === "org.tunaos.Installer.install" &&
-            subject.user === "liveuser" && subject.local && subject.active) {
+            subject.user === "liveuser" && subject.local) {
         return polkit.Result.YES;
     }
 });
