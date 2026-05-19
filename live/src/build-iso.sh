@@ -1,10 +1,13 @@
 #!/usr/bin/bash
-# build-iso.sh <boot-files-tar> <squashfs-img> <output-iso>
+# build-iso.sh [--store <store-squashfs>] <boot-files-tar> <squashfs-img> <output-iso>
 #
 # Creates a UEFI-bootable systemd-boot live ISO from pre-built components:
 #   <boot-files-tar>  — tar containing only kernel + EFI files from the rootfs
 #   <squashfs-img>    — squashfs of the full live rootfs (built with correct UIDs
 #                       via mksquashfs inside podman unshare)
+#   --store <path>    — optional: squashfs of offline OCI image store; placed at
+#                       LiveOS/store.squashfs.img so the live superiso-store.mount
+#                       unit can loop-mount it for offline installation
 #
 # Boot architecture (no GRUB2, no shim):
 #   El Torito EFI entry → EFI/efi.img (FAT ESP image containing):
@@ -19,6 +22,7 @@
 #     images/pxeboot/*          kernel/initramfs copies for loopback ISO boot tools
 #     boot/grub/loopback.cfg    metadata for Ventoy/GRUB-style loopback boot
 #     LiveOS/squashfs.img       squashfs of the full Dakota live rootfs
+#     LiveOS/store.squashfs.img offline OCI image store (if --store was given)
 #
 # Live boot flow:
 #   UEFI firmware → El Torito → FAT ESP → systemd-boot → kernel+initramfs
@@ -28,9 +32,17 @@
 
 set -euo pipefail
 
-BOOT_TAR="${1:?Usage: build-iso.sh <boot-files-tar> <squashfs-img> <output-iso>}"
-SQUASHFS_SRC="${2:?Usage: build-iso.sh <boot-files-tar> <squashfs-img> <output-iso>}"
-OUTPUT_ISO="${3:?Usage: build-iso.sh <boot-files-tar> <squashfs-img> <output-iso>}"
+STORE_SFS=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --store) STORE_SFS="${2:?--store requires a path}"; shift 2 ;;
+        *)       break ;;
+    esac
+done
+
+BOOT_TAR="${1:?Usage: build-iso.sh [--store <store-squashfs>] <boot-files-tar> <squashfs-img> <output-iso>}"
+SQUASHFS_SRC="${2:?Usage: build-iso.sh [--store <store-squashfs>] <boot-files-tar> <squashfs-img> <output-iso>}"
+OUTPUT_ISO="${3:?Usage: build-iso.sh [--store <store-squashfs>] <boot-files-tar> <squashfs-img> <output-iso>}"
 LABEL="DAKOTA_LIVE"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/iso-build.XXXXXX")
@@ -168,6 +180,12 @@ echo ">>> Loopback boot metadata added to ISO root"
 echo ">>> Copying squashfs..."
 cp "${SQUASHFS_SRC}" "${ISO_ROOT}/LiveOS/squashfs.img"
 echo ">>> Squashfs: $(du -sh "${ISO_ROOT}/LiveOS/squashfs.img" | cut -f1)"
+
+# ── Optional offline image store ─────────────────────────────────────────────
+if [[ -n "${STORE_SFS}" ]]; then
+    cp "${STORE_SFS}" "${ISO_ROOT}/LiveOS/store.squashfs.img"
+    echo ">>> Offline store: $(du -sh "${ISO_ROOT}/LiveOS/store.squashfs.img" | cut -f1)"
+fi
 
 # ── Assemble the ISO with xorriso ────────────────────────────────────────────
 echo ">>> Assembling ISO..."
