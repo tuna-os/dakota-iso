@@ -28,37 +28,23 @@ if [[ ${#IMAGES[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# Determine running user for podman unshare.
-if [[ -n "${SUDO_USER:-}" ]]; then
-    RUN_AS="${SUDO_USER}"
-else
-    RUN_AS="$(id -un)"
-fi
-
 STORE_ROOT="$(mktemp -d /var/tmp/tbox-offline-store.XXXXXX)"
 RUN_ROOT="$(mktemp -d /tmp/tbox-offrun.XXXXXX)"
-trap 'chmod -R u+rwX "${STORE_ROOT}" "${RUN_ROOT}" 2>/dev/null || true
-      rm -rf "${STORE_ROOT}" "${RUN_ROOT}"' EXIT
+trap 'rm -rf "${STORE_ROOT}" "${RUN_ROOT}"' EXIT
 
 chmod 0777 "${STORE_ROOT}" "${RUN_ROOT}"
 
-echo ">>> [offline-store] pulling ${#IMAGES[@]} image(s) into isolated overlay store..."
+echo ">>> [offline-store] copying ${#IMAGES[@]} image(s) into isolated overlay store..."
 for IMG in "${IMAGES[@]}"; do
     # Verify image is present in the local podman store before we try to copy it.
-    if ! sudo -u "${RUN_AS}" podman image exists "${IMG}" 2>/dev/null; then
+    if ! podman image exists "${IMG}" 2>/dev/null; then
         echo "ERROR: ${IMG} is not in the local podman store. Pull it first." >&2
         exit 1
     fi
 
     DEST="containers-storage:[overlay@${STORE_ROOT}+${RUN_ROOT}]${IMG}"
     echo ">>> [offline-store] copying ${IMG} ..."
-
-    # Run inside podman unshare so sub-uid overlay mappings match the live store.
-    sudo -u "${RUN_AS}" podman unshare bash -c "
-        skopeo copy --remove-signatures \
-            containers-storage:${IMG@Q} \
-            ${DEST@Q}
-    "
+    skopeo copy --remove-signatures "containers-storage:${IMG}" "${DEST}"
 done
 
 echo ">>> [offline-store] raw store size: $(du -sh "${STORE_ROOT}" | cut -f1)"
@@ -71,15 +57,11 @@ trap 'rm -f "${TMP_SFS}"' RETURN
 chmod 0666 "${TMP_SFS}"
 
 echo ">>> [offline-store] mksquashfs -> ${OUTPUT_SFS} (zstd-${SFS_LEVEL}) ..."
-
-# mksquashfs must run inside podman unshare so sub-uid mapped files are readable.
-sudo -u "${RUN_AS}" podman unshare bash -c "
-    mksquashfs ${STORE_ROOT@Q} ${TMP_SFS@Q} \
-        -noappend -comp zstd \
-        -Xcompression-level ${SFS_LEVEL} \
-        -b ${SFS_BLOCK} \
-        -processors 4
-"
+mksquashfs "${STORE_ROOT}" "${TMP_SFS}" \
+    -noappend -comp zstd \
+    -Xcompression-level "${SFS_LEVEL}" \
+    -b "${SFS_BLOCK}" \
+    -processors 4
 
 echo ">>> [offline-store] squashfs size: $(du -sh "${TMP_SFS}" | cut -f1)"
 

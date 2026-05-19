@@ -68,7 +68,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            just podman buildah mtools xorriso squashfs-tools \
+            just podman buildah skopeo mtools xorriso squashfs-tools \
             qemu-system-x86 ovmf socat sshpass \
             imagemagick -qq
 
@@ -102,9 +102,15 @@ jobs:
             /var/iso-build/dakota-nvidia.rootfs.sfs \
             /var/iso-build/boot.tar
 
-          # 3. Assemble the UEFI-bootable live ISO
-          #    (no offline store needed for the LUKS E2E — fisherman will pull from network)
+          # 3. Build offline image store (dakota-nvidia is already in root's storage
+          #    from the podman build above — no extra pull needed)
+          sudo bash scripts/build-offline-store.sh \
+            /var/iso-build/store.squashfs.img \
+            ghcr.io/projectbluefin/dakota-nvidia:latest
+
+          # 4. Assemble the UEFI-bootable live ISO with offline store embedded
           sudo bash live/src/build-iso.sh \
+            --store /var/iso-build/store.squashfs.img \
             /var/iso-build/boot.tar \
             /var/iso-build/dakota-nvidia.rootfs.sfs \
             /var/iso-build/dakota-live.iso
