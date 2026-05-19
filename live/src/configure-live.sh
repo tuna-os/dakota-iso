@@ -6,8 +6,13 @@
 #
 # At this point the initramfs has already been replaced (by the Debian
 # initramfs-builder stage) with a dmsquash-live capable one.  This script
-# handles the runtime live-environment: user, GDM autologin, tuna-installer
+# handles the runtime live-environment: user, GDM autologin, installer
 # configuration + autostart, and Flatpak pre-installation.
+#
+# TARGET (set via ARG/ENV in the Containerfile) selects which Dakota variant
+# is being built: "dakota" (stock) or "dakota-nvidia".  It controls the
+# imgref and local_imgref written into recipe.json so each squashfs image on
+# the dual-env ISO knows which OCI image it carries for offline installation.
 
 set -exo pipefail
 
@@ -253,13 +258,38 @@ install -Dm644 "$SCRIPT_DIR/images/dakotaraptor.png" /usr/share/bootc-installer/
 
 # ── Installer configuration ───────────────────────────────────────────────────
 # The bootc-installer reads both overrides from /etc/bootc-installer/:
-#   images.json — locks the catalog to Dakota only
-#   recipe.json — sets distro branding, tour slides, and install steps
+#   images.json — the full catalog of installable images (both variants)
+#   recipe.json — distro branding, tour slides, install steps, and the
+#                 local_imgref for offline installation
+#
+# TARGET controls which OCI image is embedded in this squashfs's VFS
+# containers-storage and therefore available for offline install.  Each live
+# environment on the dual-env ISO carries its own image; the other variant
+# can be installed via network.
+TARGET="${TARGET:-dakota-nvidia}"
+IMGREF="ghcr.io/projectbluefin/${TARGET}:latest"
+
 mkdir -p /etc/bootc-installer
 cp "$SCRIPT_DIR/etc/bootc-installer/images.json" /etc/bootc-installer/images.json
-cp "$SCRIPT_DIR/etc/bootc-installer/recipe.json" /etc/bootc-installer/recipe.json
-# Flag file read by the installer (tuna-os/tuna-installer#26) to activate live
-# ISO mode even when the installer is running inside a Flatpak sandbox.
+
+# Generate recipe.json with the correct imgref/local_imgref for this variant.
+# All other fields (branding, tour, steps) are identical across variants.
+python3 - << PYEOF
+import json, sys
+
+with open("$SCRIPT_DIR/etc/bootc-installer/recipe.json") as f:
+    recipe = json.load(f)
+
+recipe["imgref"] = "$IMGREF"
+recipe["local_imgref"] = "containers-storage:$IMGREF"
+
+with open("/etc/bootc-installer/recipe.json", "w") as f:
+    json.dump(recipe, f, indent=2)
+    f.write("\n")
+PYEOF
+
+# Flag file read by the installer to activate live ISO mode even when running
+# inside a Flatpak sandbox.
 touch /etc/bootc-installer/live-iso-mode
 
 # ── Installer autostart ───────────────────────────────────────────────────────
@@ -366,16 +396,48 @@ EOF
 mkdir -p /usr/lib/tmpfiles.d
 echo 'f /etc/hostname 0644 - - - dakota-live' > /usr/lib/tmpfiles.d/live-hostname.conf
 
-# ── VFS containers-storage ────────────────────────────────────────────────────
-# The ISO embeds the Dakota OCI image as VFS containers-storage in the squashfs.
-# Configure podman to use the VFS driver so the pre-embedded image is visible
-# for offline installation.  Without this, podman initializes with the overlay
-# driver at first boot, creating a db.sql that conflicts with VFS access.
+# ── containers-storage: overlay + superiso-store ──────────────────────────────
+# The ISO carries both Dakota images in a shared store squashfs
+# (LiveOS/store.squashfs.img) built by tacklebox offline_payloads.
+# dmsquash-live mounts the ISO at /run/initramfs/live, so the squashfs is
+# visible at /run/initramfs/live/LiveOS/store.squashfs.img.
+# We mount it at /var/lib/superiso-store via a systemd mount unit and register
+# it as an additionalimagestores so bootc-installer can install either image
+# without a network pull.
+
+mkdir -p /var/lib/superiso-store /var/lib/containers/storage
+
+# systemd mount unit — same pattern as superiso Containerfile.generic.
+STORE_UNIT="$(systemd-escape --path /var/lib/superiso-store).mount"
+cat > "/usr/lib/systemd/system/${STORE_UNIT}" << 'STOREUNITEOF'
+[Unit]
+Description=Tacklebox offline image store (loop-mounted from live ISO)
+DefaultDependencies=no
+After=systemd-remount-fs.service local-fs-pre.target
+Before=local-fs.target
+ConditionPathExists=/run/initramfs/live/LiveOS/store.squashfs.img
+
+[Mount]
+What=/run/initramfs/live/LiveOS/store.squashfs.img
+Where=/var/lib/superiso-store
+Type=squashfs
+Options=loop,ro,nodev
+
+[Install]
+WantedBy=local-fs.target
+STOREUNITEOF
+systemctl enable "${STORE_UNIT}"
+
+# overlay driver + additionalimagestores so both Dakota images are resolvable
+# by bootc-installer and fisherman without touching the live writable store.
+mkdir -p /etc/containers
 cat > /etc/containers/storage.conf << 'STOREOF'
 [storage]
-driver = "vfs"
+driver = "overlay"
 runroot = "/run/containers/storage"
 graphroot = "/var/lib/containers/storage"
+[storage.options]
+additionalimagestores = ["/var/lib/superiso-store"]
 STOREOF
 
 # fisherman handles scratch space, transport-prefix stripping, OCI export, and
