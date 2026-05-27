@@ -38,17 +38,17 @@ flatpak remote-add --system --if-not-exists flathub \
 # INSTALLER_CHANNEL controls which release tag to pull from:
 #   stable (default) → continuous   (latest stable build from main/prod)
 #   dev              → continuous-dev (latest dev build, tracks dev branch)
-RELEASE_TAG="v2.4.0"
+# castrojo/tuna-installer is the Project Bluefin Dakota fork of tuna-os/tuna-installer.
+# v1.0.0 bundles fisherman v0.2.0-17 which includes the fix for #38 (OCI cache
+# mount on composefs/btrfs). Do not revert to tuna-os/tuna-installer.
+RELEASE_TAG="v1.0.0"
 FLATPAK_FILENAME="org.bootcinstaller.Installer.flatpak"
-# NOTE: Do NOT change stable back to "continuous" — that rolling release was
-# silently updated 2026-05-09 with v2.5.0 which contains the broken overlay
-# storage code path. Pinned to v2.4.0 until tuna-os/fisherman#38 is resolved.
 if [[ "${INSTALLER_CHANNEL:-stable}" == "dev" ]]; then
     RELEASE_TAG="continuous-dev"
     FLATPAK_FILENAME="org.bootcinstaller.Installer.Devel.flatpak"
 fi
 curl --retry 3 --location \
-    "https://github.com/tuna-os/tuna-installer/releases/download/${RELEASE_TAG}/${FLATPAK_FILENAME}" \
+    "https://github.com/castrojo/tuna-installer/releases/download/${RELEASE_TAG}/${FLATPAK_FILENAME}" \
     -o /tmp/tuna-installer.flatpak
 INSTALLER_APP_ID="org.bootcinstaller.Installer"
 [[ "${INSTALLER_CHANNEL:-stable}" == "dev" ]] && INSTALLER_APP_ID="org.bootcinstaller.Installer.Devel"
