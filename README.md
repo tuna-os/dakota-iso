@@ -1,10 +1,15 @@
 # Dakota Live ISO
 
-[![Build and Publish](https://github.com/tuna-os/dakota-iso/actions/workflows/build-iso.yml/badge.svg)](https://github.com/tuna-os/dakota-iso/actions/workflows/build-iso.yml)
+[![Build and Publish](https://github.com/projectbluefin/dakota-iso/actions/workflows/build-iso.yml/badge.svg)](https://github.com/projectbluefin/dakota-iso/actions/workflows/build-iso.yml)
 
-**[⬇ Download Latest ISO](https://download.tunaos.org/dakota/dakota-live-latest.iso)**
+| Variant | Download | Checksum |
+|---------|----------|----------|
+| **Dakota** | [⬇ dakota-live-latest.iso](https://projectbluefin.dev/dakota-live-latest.iso) | [checksum](https://projectbluefin.dev/dakota-live-latest.iso-CHECKSUM) |
+| **Dakota NVIDIA** | [⬇ dakota-nvidia-live-latest.iso](https://projectbluefin.dev/dakota-nvidia-live-latest.iso) | [checksum](https://projectbluefin.dev/dakota-nvidia-live-latest.iso-CHECKSUM) |
 
-Builds a bootable UEFI live ISO from the [Dakota](https://github.com/projectbluefin/dakota) image — a GNOME OS-based workstation using composefs and systemd-boot. The live environment boots straight to GDM with a full GNOME session and launches the Dakota installer automatically.
+Builds bootable UEFI live ISOs from [Dakota](https://github.com/projectbluefin/dakota) images — GNOME OS-based workstations using composefs and systemd-boot. The live environment boots straight to GDM with a full GNOME session and launches the Dakota installer automatically.
+
+The **NVIDIA** variant includes proprietary NVIDIA drivers baked into the image for systems with NVIDIA GPUs.
 
 ## How it works
 
@@ -26,8 +31,8 @@ At boot, `dmsquash-live` mounts the squashfs and creates an overlayfs so the liv
 |---|---|
 | `podman` | Rootless works; needs `--cap-add sys_admin` for the live env build |
 | `just` | Task runner — `cargo install just` or distro package |
-| KVM + `qemu-system-x86_64` | For local boot testing only |
-| OVMF firmware | `edk2-ovmf` (Fedora/RHEL) or `ovmf` (Debian/Ubuntu) |
+| KVM + `qemu-system-x86_64` | For local boot testing on amd64 only |
+| OVMF firmware | `edk2-ovmf` (Fedora/RHEL) or `ovmf` (Debian/Ubuntu) — amd64 |
 
 **Disk space:** The build needs ~22 GB free:
 - ~12 GB for the rootfs tarball (Flatpak-heavy)
@@ -40,11 +45,14 @@ By default, output goes to `./output/`. If `/tmp` is a small tmpfs on your machi
 
 ```bash
 # Clone the repo
-git clone https://github.com/tuna-os/dakota-iso
+git clone https://github.com/projectbluefin/dakota-iso
 cd dakota-iso
 
 # Full build — live env container + ISO assembly
 just iso-sd-boot dakota
+
+# Build the NVIDIA variant
+just iso-sd-boot dakota-nvidia
 
 # Override output directory (if ./output/ is on a small filesystem)
 just output_dir=/var/data/iso-output iso-sd-boot dakota
@@ -52,7 +60,7 @@ just output_dir=/var/data/iso-output iso-sd-boot dakota
 
 The build takes **20–40 minutes** depending on your internet connection — the Flatpak install step downloads ~2 GB from Flathub.
 
-Output: `output/dakota-live.iso` (~4.5 GB)
+Output: `output/<target>-live.iso` (~4.5 GB)
 
 ### Build stages
 
@@ -61,6 +69,26 @@ just container dakota          # Build the live environment container
 just iso-builder dakota        # Build the ISO assembly toolchain container
 just iso-sd-boot dakota        # Full end-to-end build (runs both above + assembles ISO)
 ```
+
+### Building the NVIDIA variant
+
+```bash
+just iso-sd-boot dakota-nvidia
+```
+
+The only difference is the `payload_ref` file — everything else (Containerfile, scripts, ISO assembly) is shared.
+
+## Adding a new variant
+
+Each variant is a directory containing a single file — `payload_ref` — with the OCI image reference:
+
+```bash
+mkdir my-variant
+echo 'ghcr.io/projectbluefin/my-variant:latest' > my-variant/payload_ref
+just iso-sd-boot my-variant
+```
+
+The Containerfile accepts a `BASE_IMAGE` build-arg (defaulting to `ghcr.io/projectbluefin/dakota:latest`). The justfile reads `<target>/payload_ref` and passes it as the build-arg automatically. The installer configs inside the ISO are patched at build time to reference the correct image.
 
 ## Testing
 

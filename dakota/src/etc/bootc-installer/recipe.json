@@ -4,16 +4,35 @@
   "distro_logo": "resource:///org/bootcinstaller/Installer/images/dakota.png",
   "imgref": "ghcr.io/projectbluefin/dakota:latest",
   "local_imgref": "containers-storage:ghcr.io/projectbluefin/dakota:latest",
+  "bootloader": "systemd",
+  "composeFsBackend": true,
+  "distroID": "dakota",
+  "brewTap": "ublue-os/tap",
   "tour": {
     "welcome": {
-      "image": "resource:///org/bootcinstaller/Installer/images/dakota.png",
-      "title": "Installing Dakota",
-      "description": "This will take a few minutes. Dakota is a GNOME OS-based workstation powered by composefs and systemd-boot."
+      "image": "/run/host/usr/share/bootc-installer/images/dakotaraptor.png",
+      "title": "Welcome to Dakota",
+      "description": "This is an Alpha of the all new Bluefin. Thanks for volunteering to help!"
+    },
+    "features": {
+      "image": "/run/host/usr/share/bootc-installer/images/dakotaraptor.png",
+      "title": "What's the plan?",
+      "description": "Test apps, commands and workflows. File issues. We fix them. Rinse and repeat."
+    },
+    "community": {
+      "image": "/run/host/usr/share/bootc-installer/images/dakotaraptor.png",
+      "title": "Where are the docs?",
+      "description": "Documentation at docs.projectbluefin.io. Test Bluefin's features."
+    },
+    "developer": {
+      "image": "/run/host/usr/share/bootc-installer/images/dakotaraptor.png",
+      "title": "Updates",
+      "description": "Updates will come daily. If something is broken, file an issue. "
     },
     "completed": {
-      "resource": "/org/bootcinstaller/Installer/assets/complete.svg",
-      "title": "Installation Complete",
-      "description": "Dakota is ready. Remove the installation media and reboot."
+      "image": "/run/host/usr/share/bootc-installer/images/dakotaraptor.png",
+      "title": "Become Legend",
+      "description": "When this is done reboot into Bluefin. Welcome to the new world!"
     }
   },
   "steps": {
@@ -30,9 +49,6 @@
     },
     "encryption": {
       "template": "encryption"
-    },
-    "user": {
-      "template": "user"
     }
   }
 }

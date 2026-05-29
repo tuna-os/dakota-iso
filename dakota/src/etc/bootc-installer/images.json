@@ -5,7 +5,7 @@
     {
       "name": "Dakota",
       "imgref": "ghcr.io/projectbluefin/dakota:latest",
-      "desc": "GNOME workstation on GnomeOS — composefs + systemd-boot",
+      "desc": "Project Bluefin Prototype",
       "icon": "resource:///org/bootcinstaller/Installer/images/dakota.png",
       "bootloader": "systemd",
       "filesystem": "btrfs",

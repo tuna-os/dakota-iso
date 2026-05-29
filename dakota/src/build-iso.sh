@@ -8,13 +8,16 @@
 #
 # Boot architecture (no GRUB2, no shim):
 #   El Torito EFI entry → EFI/efi.img (FAT ESP image containing):
-#     EFI/BOOT/BOOTX64.EFI     systemd-bootx64.efi from Dakota
+#     EFI/BOOT/BOOTX64.EFI or BOOTAA64.EFI  systemd-boot EFI binary (arch-detected)
 #     loader/loader.conf        systemd-boot configuration
 #     loader/entries/dakota-live.conf   boot entry (kernel + initrd + cmdline)
 #     images/pxeboot/vmlinuz    Dakota kernel
 #     images/pxeboot/initrd.img dmsquash-live initramfs
 #   ISO9660 root:
+#     EFI/BOOT/BOOTX64.EFI      EFI fallback path (same binary) for Proxmox OVMF / Ventoy
 #     EFI/efi.img               (also referenced by El Torito)
+#     images/pxeboot/*          kernel/initramfs copies for loopback ISO boot tools
+#     boot/grub/loopback.cfg    metadata for Ventoy/GRUB-style loopback boot
 #     LiveOS/squashfs.img       squashfs of the full Dakota live rootfs
 #
 # Live boot flow:
@@ -49,13 +52,30 @@ echo ">>> Kernel: ${kernel}"
 
 VMLINUZ="${BOOT_DIR}/usr/lib/modules/${kernel}/vmlinuz"
 INITRD="${BOOT_DIR}/usr/lib/modules/${kernel}/initramfs.img"
-BOOTX64="${BOOT_DIR}/usr/lib/systemd/boot/efi/systemd-bootx64.efi"
 
-for f in "${VMLINUZ}" "${INITRD}" "${BOOTX64}"; do
+# Detect EFI binary: arm64 ships systemd-bootaa64.efi → BOOTAA64.EFI
+#                   amd64 ships systemd-bootx64.efi  → BOOTX64.EFI
+BOOT_EFI_SRC=""
+BOOT_EFI_DEST=""
+for _candidate in \
+    "systemd-bootaa64.efi:EFI/BOOT/BOOTAA64.EFI" \
+    "systemd-bootx64.efi:EFI/BOOT/BOOTX64.EFI"; do
+    _src="${BOOT_DIR}/usr/lib/systemd/boot/efi/${_candidate%%:*}"
+    _dest="${_candidate##*:}"
+    if [[ -f "${_src}" ]]; then
+        BOOT_EFI_SRC="${_src}"
+        BOOT_EFI_DEST="${_dest}"
+        break
+    fi
+done
+[[ -n "${BOOT_EFI_SRC}" ]] || { echo "ERROR: no systemd-boot EFI binary found in boot-files tar"; exit 1; }
+
+for f in "${VMLINUZ}" "${INITRD}" "${BOOT_EFI_SRC}"; do
     [[ -f "${f}" ]] || { echo "ERROR: missing ${f}"; exit 1; }
 done
 echo ">>> Kernel:   $(du -sh "${VMLINUZ}"  | cut -f1)"
 echo ">>> Initramfs: $(du -sh "${INITRD}"   | cut -f1)"
+echo ">>> EFI:      ${BOOT_EFI_SRC} → ${BOOT_EFI_DEST}"
 
 # ── Assemble the ESP staging directory ──────────────────────────────────────
 # systemd-boot reads loader entries and kernel/initramfs exclusively from the
@@ -65,7 +85,7 @@ mkdir -p \
     "${ESP_STAGING}/loader/entries" \
     "${ESP_STAGING}/images/pxeboot"
 
-cp "${BOOTX64}" "${ESP_STAGING}/EFI/BOOT/BOOTX64.EFI"
+cp "${BOOT_EFI_SRC}" "${ESP_STAGING}/${BOOT_EFI_DEST}"
 cp "${VMLINUZ}" "${ESP_STAGING}/images/pxeboot/vmlinuz"
 cp "${INITRD}"  "${ESP_STAGING}/images/pxeboot/initrd.img"
 
@@ -79,12 +99,15 @@ EOF
 #   rd.live.image               enable dmsquash-live mode
 #   rd.live.overlay.overlayfs=1 use overlayfs (not device mapper) for the rw layer
 #   enforcing=0                 disable SELinux enforcement (GNOME OS ships it)
-#   console=ttyS0,115200n8      serial output — validation target
+#   console=ttyS0,115200n8      serial output on amd64 (16550/QEMU q35) — validation target
+#   console=ttyAMA0,115200n8    serial output on arm64 (PL011/QEMU virt) — validation target; listed
+#                                last so it wins /dev/console on hardware where both UARTs exist
+#   Both consoles listed: Linux silently ignores the one that doesn't exist on the running arch.
 cat > "${ESP_STAGING}/loader/entries/dakota-live.conf" << EOF
 title   Dakota Live
 linux   /images/pxeboot/vmlinuz
 initrd  /images/pxeboot/initrd.img
-options root=live:CDLABEL=${LABEL} rd.live.image rd.live.overlay.overlayfs=1 enforcing=0 quiet console=ttyS0,115200n8
+options root=live:CDLABEL=${LABEL} rd.live.image rd.live.overlay.overlayfs=1 enforcing=0 quiet console=ttyS0,115200n8 console=ttyAMA0,115200n8
 EOF
 
 # ── Create the FAT ESP image ──────────────────────────────────────────────────
@@ -111,11 +134,35 @@ mmd -i "${ESP_IMG}" \
     ::/images \
     ::/images/pxeboot
 
-mcopy -i "${ESP_IMG}" "${ESP_STAGING}/EFI/BOOT/BOOTX64.EFI"            ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i "${ESP_IMG}" "${ESP_STAGING}/${BOOT_EFI_DEST}"            ::/"${BOOT_EFI_DEST}"
 mcopy -i "${ESP_IMG}" "${ESP_STAGING}/loader/loader.conf"               ::/loader/loader.conf
 mcopy -i "${ESP_IMG}" "${ESP_STAGING}/loader/entries/dakota-live.conf"  ::/loader/entries/dakota-live.conf
 mcopy -i "${ESP_IMG}" "${ESP_STAGING}/images/pxeboot/vmlinuz"           ::/images/pxeboot/vmlinuz
 mcopy -i "${ESP_IMG}" "${ESP_STAGING}/images/pxeboot/initrd.img"        ::/images/pxeboot/initrd.img
+
+# ── EFI fallback path on the ISO9660 root ────────────────────────────────────
+# UEFI firmware that does not use El Torito (e.g. Proxmox OVMF, some bare-metal
+# boards, Ventoy UEFI chainloading) scans the ISO9660 root for the removable
+# media fallback: EFI/BOOT/BOOTX64.EFI (amd64) or EFI/BOOT/BOOTAA64.EFI (arm64).
+# Placing the systemd-boot binary here makes the ISO bootable on those platforms
+# without touching the El Torito path used by libvirt/QEMU and standard OVMF.
+mkdir -p "${ISO_ROOT}/EFI/BOOT"
+cp "${BOOT_EFI_SRC}" "${ISO_ROOT}/${BOOT_EFI_DEST}"
+echo ">>> EFI fallback: ${BOOT_EFI_DEST} added to ISO root"
+
+# ── ISO-root kernel/initramfs and loopback metadata ──────────────────────────
+# Ventoy and GRUB-style loopback boot tools expect kernel/initramfs paths in the
+# ISO filesystem itself, not only inside the El Torito ESP image.
+mkdir -p "${ISO_ROOT}/images/pxeboot" "${ISO_ROOT}/boot/grub"
+cp "${VMLINUZ}" "${ISO_ROOT}/images/pxeboot/vmlinuz"
+cp "${INITRD}"  "${ISO_ROOT}/images/pxeboot/initrd.img"
+cat > "${ISO_ROOT}/boot/grub/loopback.cfg" << EOF
+menuentry "Dakota Live" {
+    linux /images/pxeboot/vmlinuz root=live:CDLABEL=${LABEL} rd.live.image rd.live.overlay.overlayfs=1 enforcing=0 quiet console=ttyS0,115200n8 console=ttyAMA0,115200n8 rd.dakota.isofile=\${iso_path}
+    initrd /images/pxeboot/initrd.img
+}
+EOF
+echo ">>> Loopback boot metadata added to ISO root"
 
 # ── Place the pre-built squashfs ─────────────────────────────────────────────
 echo ">>> Copying squashfs..."
@@ -124,23 +171,51 @@ echo ">>> Squashfs: $(du -sh "${ISO_ROOT}/LiveOS/squashfs.img" | cut -f1)"
 
 # ── Assemble the ISO with xorriso ────────────────────────────────────────────
 echo ">>> Assembling ISO..."
-# Native xorriso mode (-dev) with a pre-created file avoids both the DVD-R
-# ~1.7 GiB media cap (which affects -outdev on blank files) and the El Torito
-# catalog structure issues from -as mkisofs -eltorito-alt-boot (which creates
-# an alternate section without a primary entry, confusing some UEFI firmware).
-# -boot_image any platform_id=0xef creates a proper EFI primary boot section.
-rm -f "${OUTPUT_ISO}"
-touch "${OUTPUT_ISO}"
-xorriso \
-    -dev "stdio:${OUTPUT_ISO}" \
-    -volid "${LABEL}" \
-    -rockridge on \
-    -joliet on \
-    -map "${ISO_ROOT}" / \
-    -boot_image any efi_path=EFI/efi.img \
-    -boot_image any platform_id=0xef \
-    -commit
+# xorriso -as mkisofs mode:
+#   -iso-level 3   required for files >2 GiB (squashfs is ~4.5 GiB)
+#   -r             Rock Ridge extensions (Linux long filenames / permissions)
+#   -J --joliet-long  Joliet extensions (Windows compatibility)
+#   --efi-boot EFI/efi.img   El Torito EFI boot entry (platform 0xef)
+#   -efi-boot-part           expose the EFI image as a GPT partition
+#   --efi-boot-image         finalize the EFI boot partition record
+#
+# This is the approach used since the repo's first working ISO (commit 7ab0901).
+# It produces:
+#   - A protective MBR (type 0xEE) so UEFI firmware immediately switches to GPT
+#   - A GPT entry covering the ESP image — old firmware (2022 Acer, Dell pre-2023)
+#     scans for this and auto-discovers the USB as a bootable EFI device
+#   - An El Torito EFI catalog entry for optical/VM/newer-firmware boot
+#   - fdisk reports "Disklabel type: gpt" — confirming the protective MBR
+#
+# Why NOT native mode with part_like_isohybrid / partition_entry=gpt_basdat:
+#   That approach creates a hybrid MBR (not protective), so fdisk reports "dos".
+#   Old UEFI firmware sees a "dos" disk, skips GPT, finds no EFI entries in the
+#   MBR partition table, and does not show the USB in the boot menu.
+#   (See issues #15, https://github.com/projectbluefin/dakota-iso/issues/15)
+xorriso -as mkisofs \
+    -iso-level 3 \
+    -r \
+    -J --joliet-long \
+    -V "${LABEL}" \
+    --efi-boot EFI/efi.img \
+    -efi-boot-part \
+    --efi-boot-image \
+    -o "${OUTPUT_ISO}" \
+    "${ISO_ROOT}"
 
 implantisomd5 "${OUTPUT_ISO}" 2>/dev/null || true
+
+# ── Verify protective MBR + GPT layout ───────────────────────────────────────
+# Expected: "System area summary: MBR protective-msdos-label cyl-align-off GPT"
+# fdisk on the ISO should report "Disklabel type: gpt" (not "dos").
+# "dos" means a hybrid MBR was created instead of a protective one — old
+# firmware will not see the GPT and may not discover the USB as bootable.
+echo ">>> Partition layout:"
+xorriso -indev "${OUTPUT_ISO}" -report_system_area plain 2>/dev/null | \
+    grep -E '^(System area|ISO image size|MBR|GPT|Partition)' || true
+xorriso -indev "${OUTPUT_ISO}" -report_system_area plain 2>/dev/null | \
+    grep 'System area summary' | grep -q 'protective' && \
+    echo ">>> Protective MBR + GPT: OK" || \
+    echo ">>> WARNING: protective MBR not found — USB may not boot on older firmware"
 
 echo ">>> Done: ${OUTPUT_ISO} ($(du -sh "${OUTPUT_ISO}" | cut -f1))"

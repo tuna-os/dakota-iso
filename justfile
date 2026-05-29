@@ -5,6 +5,11 @@ image-builder-dev := "image-builder-dev"
 # Override with: just output_dir=/your/path iso-sd-boot dakota
 output_dir := "output"
 
+# Working directory for ISO builds where container storage staging
+# and the squashfs-root are stored.
+# override with: just workdir=/your/path iso-sd-boot dakota
+workdir := output_dir
+
 # Set to 1 to enable SSH in the live session for debugging.
 # Example: just debug=1 output_dir=/tmp/out iso-sd-boot dakota
 # Never use debug=1 for production/release ISOs.
@@ -15,11 +20,47 @@ debug := "0"
 # Example: just installer_channel=dev iso-sd-boot dakota
 installer_channel := "stable"
 
+# LUKS passphrase used by luks-install for reproducing issue #270.
+# Example: just luks-passphrase=MySecret luks-install dakota
+luks-passphrase := "testpassphrase"
+
 # Squashfs compression preset:
 #   fast    (default) — zstd level 3,  128K blocks — quick local builds/CI
 #   release           — zstd level 15, 1M blocks   — ~20% smaller, ~5× slower
 # Example: just compression=release iso-sd-boot dakota
 compression := "fast"
+
+# Create an XFS loopback mount at /mnt for faster VFS import.
+#
+# The chunkified Dakota images (~120 layers) cause VFS import under BTRFS
+# to create ~450 GB of intermediate directories.  XFS handles this workload
+# much faster.  This recipe creates a 45 GB XFS loopback at /mnt.
+#
+# Idempotent: skips if /mnt is already an XFS mount.
+# Must be run as root: sudo just mount-xfs
+mount-xfs:
+    #!/usr/bin/bash
+    set -euo pipefail
+    # Already XFS? Nothing to do.
+    if findmnt -n -o FSTYPE /mnt 2>/dev/null | grep -q '^xfs$'; then
+        echo "/mnt is already XFS — skipping"
+        exit 0
+    fi
+    echo "Creating 45G XFS loopback at /mnt..."
+    IMG="/var/tmp/dakota-xfs-loopback.img"
+    truncate -s 0 "${IMG}"
+    # Disable copy-on-write on BTRFS hosts (harmless no-op on other fs)
+    chattr +C "${IMG}" 2>/dev/null || true
+    fallocate -l 45G "${IMG}"
+    mkfs.xfs -f "${IMG}"
+    mount -o loop "${IMG}" /mnt
+    echo "XFS mounted at /mnt (45G)"
+    echo ""
+    echo "Now run your build with workdir on /mnt:"
+    echo "  sudo just workdir=/mnt iso-sd-boot dakota"
+    echo "To run rootless (replace \`user\` with your username):"
+    echo "  sudo chown user:user /mnt && just workdir=/mnt iso-sd-boot dakota"
+    df -h /mnt
 
 # Build the ISO in the background, detached from the terminal session.
 # Logs are written to {{output_dir}}/build.log and tailed live.
@@ -48,17 +89,19 @@ _payload_ref_flag target:
     @if [ -f "{{target}}/payload_ref" ]; then echo "--bootc-installer-payload-ref $(cat '{{target}}/payload_ref' | tr -d '[:space:]')"; fi
 
 container target:
+    @test -f "{{target}}/payload_ref" || { echo "ERROR: {{target}}/payload_ref not found — create it with the base image reference, e.g.: echo 'ghcr.io/projectbluefin/dakota:latest' > {{target}}/payload_ref"; exit 1; }
     podman build --cap-add sys_admin --security-opt label=disable \
         --layers \
         --build-arg DEBUG={{debug}} \
         --build-arg INSTALLER_CHANNEL={{installer_channel}} \
-        -t {{target}}-installer ./{{target}}
+        --build-arg BASE_IMAGE=$(cat {{target}}/payload_ref | tr -d '[:space:]') \
+        -t {{target}}-installer -f ./dakota/Containerfile ./dakota
 
 # Build the Debian-based ISO assembly container for the given target.
 # This container has xorriso, mksquashfs, dosfstools, and mtools.
 iso-builder target:
     podman build --security-opt label=disable -t {{target}}-iso-builder \
-        -f ./{{target}}/Containerfile.builder ./{{target}}
+        -f ./dakota/Containerfile.builder ./dakota
 
 # Build a systemd-boot UEFI live ISO for the given target.
 #
@@ -76,20 +119,55 @@ iso-builder target:
 iso-sd-boot target:
     #!/usr/bin/bash
     set -euo pipefail
+    PAYLOAD_IMAGE=$(cat "{{target}}/payload_ref" | tr -d '[:space:]')
 
-    just debug={{debug}} installer_channel={{installer_channel}} container {{target}}
     mkdir -p {{output_dir}}
     OUTPUT_DIR=$(realpath "{{output_dir}}")
+    WORKDIR=$(realpath "{{workdir}}")
+
+    echo "=== Disk space before container build ==="
+    df -h "${OUTPUT_DIR}"
+
+    # Hint: XFS at /mnt dramatically speeds up VFS import for chunkified images.
+    # Skip hint if WORKDIR is already set (e.g., CI with BTRFS).
+    if ! findmnt -n -o FSTYPE -T "${WORKDIR}" 2>/dev/null | grep -qE '^(xfs|btrfs)$'; then
+        echo "Hint: $WORKDIR is not an XFS/BTRFS mount.  For faster VFS import, run:" >&2
+        echo "  sudo just mount-xfs" >&2
+        echo "  sudo just workdir=/mnt iso-sd-boot {{target}}" >&2
+    fi
+
+    # Preflight space check: warn if the output dir's filesystem looks tight.
+    # This is advisory — CI environments manage space externally (XFS loopback,
+    # secondary /mnt mounts) so hard-failing here would be wrong.
+    # We check output dir (not /) because on composefs/ostree systems df / reports 0.
+    AVAILABLE_KB=$(df --output=avail -B1024 "${OUTPUT_DIR}" | tail -1 | tr -d ' ')
+    REQUIRED_KB=$((20 * 1024 * 1024))  # 20GB minimum for ISO output
+    if [ "$AVAILABLE_KB" -lt "$REQUIRED_KB" ]; then
+        echo "WARNING: Only $(( AVAILABLE_KB / 1024 / 1024 ))GB free on $(df --output=target "${OUTPUT_DIR}" | tail -1) — ISO output needs ~5GB, full build needs more" >&2
+        echo "Hint: set output_dir= to a path with more space, or use a larger disk" >&2
+    fi
+    podman images --format "table {{{{.Repository}}}}\t{{{{.Tag}}}}\t{{{{.Size}}}}" 2>/dev/null || true
+
+    just debug={{debug}} installer_channel={{installer_channel}} container {{target}}
+
+    echo "=== Disk space after container build ==="
+    df -h "${OUTPUT_DIR}"
+    podman images --format "table {{{{.Repository}}}}\t{{{{.Tag}}}}\t{{{{.Size}}}}" 2>/dev/null || true
+
+    # Aggressively free space: remove dangling images and known disposable images.
+    # The only image we need is localhost/{{target}}-installer.
+    podman rmi debian:sid 2>/dev/null || true
+    podman image prune -f 2>/dev/null || true
+    echo "=== Disk space after intermediate cleanup ==="
+    df -h "${OUTPUT_DIR}"
 
     # podman unshare enters the user namespace so rootless podman's sub-uid mapped
     # files are accessible/removable.  When running as root (e.g. CI with sudo),
     # there is no user namespace to enter — run commands directly instead.
     if [[ $(id -u) -eq 0 ]]; then
         _ns()    { bash -c "$1"; }
-        _ns_rm() { rm -rf "$@"; }
     else
         _ns()    { podman unshare bash -c "$1"; }
-        _ns_rm() { podman unshare rm -rf "$@"; }
     fi
 
     # The OCI payload (for offline install) is built into a staging directory on
@@ -99,55 +177,125 @@ iso-sd-boot target:
     # -processors 4 caps memory usage — default (all CPUs) OOMs on this machine.
     SQUASHFS="${OUTPUT_DIR}/{{target}}-rootfs.sfs"
     BOOT_TAR="${OUTPUT_DIR}/{{target}}-boot-files.tar"
-    CS_STAGING="${OUTPUT_DIR}/{{target}}-cs-staging"
-    SQUASHFS_ROOT="${OUTPUT_DIR}/{{target}}-sfs-root"
+    CS_STAGING="${WORKDIR}/{{target}}-cs-staging"
+    SQUASHFS_ROOT="${WORKDIR}/{{target}}-sfs-root"
     # CS_STAGING and SQUASHFS_ROOT contain sub-uid owned files; must be removed inside the namespace.
-    trap "rm -f '${SQUASHFS}' '${BOOT_TAR}' '${OUTPUT_DIR}/{{target}}-payload.oci.tar'; _ns_rm '${CS_STAGING}' '${SQUASHFS_ROOT}' 2>/dev/null || true" EXIT
+    trap "rm -f '${SQUASHFS}' '${BOOT_TAR}' '${OUTPUT_DIR}/{{target}}-payload.oci.tar' 2>/dev/null || true" EXIT
+    echo "=== Disk space before squashfs assembly ==="
+    df -h "${OUTPUT_DIR}"
+    if [[ "$WORKDIR" != "$OUTPUT_DIR" ]]; then
+        df -h "${WORKDIR}"
+    fi
     echo "Building squashfs and boot tar from localhost/{{target}}-installer..."
     _ns "
         set -euo pipefail
+        echo '=== Disk space inside _ns block ==='
+        df -h '${OUTPUT_DIR}'
+        if [[ '$WORKDIR' != '$OUTPUT_DIR' ]]; then
+            df -h '${WORKDIR}'
+        fi
+
+        SQUASHFS_ROOT='${SQUASHFS_ROOT}'
+        CS_STAGING='${CS_STAGING}'
+        OVERLAY_UPPER=\$(mktemp -d \"\${SQUASHFS_ROOT}_upper_XXXXXX\")
+        OVERLAY_WORK=\$(mktemp -d \"\${SQUASHFS_ROOT}_work_XXXXXX\")
+
+        ns_cleanup() {
+            umount \"\${SQUASHFS_ROOT}/var/lib/containers/storage\" 2>/dev/null || true
+            umount \"\${SQUASHFS_ROOT}\"                            2>/dev/null || true
+            podman image unmount localhost/{{target}}-installer     2>/dev/null || true
+            rm -rf \"\${OVERLAY_UPPER}\" \"\${OVERLAY_WORK}\"       2>/dev/null || true
+            rm -rf \"\${CS_STAGING}\" \"\${SQUASHFS_ROOT}\"         2>/dev/null || true
+        }
+        trap ns_cleanup EXIT
+
         MOUNT=\$(podman image mount localhost/{{target}}-installer)
         PATH=/usr/sbin:/usr/bin:/home/linuxbrew/.linuxbrew/bin:\$PATH
 
         # Populate containers-storage in a staging dir on /var (197G free).
         # Two-step skopeo copy decouples source and destination storage configs.
         PAYLOAD_OCI='${OUTPUT_DIR}/{{target}}-payload.oci.tar'
-        CS_STAGING='${CS_STAGING}'
-        SQUASHFS_ROOT='${SQUASHFS_ROOT}'
         SQUASHFS_STORAGE=\"\${CS_STAGING}/var/lib/containers/storage\"
-        LIVE_RUNROOT=\"\$(mktemp -d '${OUTPUT_DIR}'/live-runroot-XXXXXX)\"
+        # Storage conf for skopeo running inside the installer container.
+        # Paths are container-relative: /vfs-storage is the bind-mounted SQUASHFS_STORAGE.
         STORAGE_CONF=\"\$(mktemp '${OUTPUT_DIR}'/live-storage-XXXXXX.conf)\"
         mkdir -p \"\${SQUASHFS_STORAGE}\"
-        printf '[storage]\ndriver = \"vfs\"\nrunroot = \"%s\"\ngraphroot = \"%s\"\n' \
-            \"\${LIVE_RUNROOT}\" \"\${SQUASHFS_STORAGE}\" > \"\${STORAGE_CONF}\"
+        printf '[storage]\ndriver = \"vfs\"\nrunroot = \"/tmp/cs-runroot\"\ngraphroot = \"/vfs-storage\"\n' \
+            > \"\${STORAGE_CONF}\"
 
-        echo 'Exporting Dakota OCI image to archive...'
-        skopeo copy \
-            containers-storage:ghcr.io/projectbluefin/dakota:latest \
-            oci-archive:\${PAYLOAD_OCI}:ghcr.io/projectbluefin/dakota:latest
+        # Chunkified Dakota images have ~120 layers; VFS storage copies the full OS
+        # filesystem at each layer (~6GB) = ~720GB total. One squashed layer = ~6GB.
+        # Uses buildah (not podman create/commit) because buildah preserves the
+        # original image config (CMD, ENTRYPOINT, ENV, labels, annotations).
+        # podman create --entrypoint /bin/sh would corrupt the config, causing
+        # fisherman's \`podman run ... bootc install\` to fail with \`cannot execute
+        # binary file\` (sh treats the bootc ELF binary as a script).
+        echo 'Exporting squashed OCI image to archive...'
+        echo '=== Squashing '"${PAYLOAD_IMAGE}"' to single layer (avoids VFS explosion) ==='
+        SQUASH_CTR=\$(buildah from --pull-never '"${PAYLOAD_IMAGE}"')
+        buildah commit --squash \"\${SQUASH_CTR}\" oci-archive:\${PAYLOAD_OCI}:'"${PAYLOAD_IMAGE}"'
+        buildah rm \"\${SQUASH_CTR}\"
+        podman rmi '"${PAYLOAD_IMAGE}"' || true
 
         echo 'Importing Dakota OCI image into squashfs containers-storage...'
-        CONTAINERS_STORAGE_CONF=\"\${STORAGE_CONF}\" \
-        skopeo copy \
-            oci-archive:\${PAYLOAD_OCI}:ghcr.io/projectbluefin/dakota:latest \
-            containers-storage:ghcr.io/projectbluefin/dakota:latest
+        echo '=== Disk space before VFS import ==='
+        df -h '${OUTPUT_DIR}'
+        if [[ '$WORKDIR' != '$OUTPUT_DIR' ]]; then
+            df -h '${WORKDIR}'
+        fi
+        # Run skopeo from inside the installer image so the VFS tar-split metadata is
+        # written in a format the live ISO can read.  The build host links a newer
+        # containers/storage that emits a binary tar-split format; the installer image
+        # carries the same containers/storage version as the live ISO and writes the
+        # JSON-based format it expects.
+        podman run --rm \
+            --privileged \
+            -v \"\${PAYLOAD_OCI}:/payload.oci.tar:ro\" \
+            -v \"\${SQUASHFS_STORAGE}:/vfs-storage\" \
+            -v \"\${STORAGE_CONF}:/tmp/st.conf:ro\" \
+            localhost/{{target}}-installer \
+            sh -c 'mkdir -p /tmp/cs-runroot /var/tmp && CONTAINERS_STORAGE_CONF=/tmp/st.conf skopeo copy oci-archive:/payload.oci.tar:'"${PAYLOAD_IMAGE}"' containers-storage:'"${PAYLOAD_IMAGE}"''
+
 
         rm -f \"\${PAYLOAD_OCI}\" \"\${STORAGE_CONF}\"
-        rm -rf \"\${LIVE_RUNROOT}\"
+
+        echo '=== Disk space after VFS import ==='
+        df -h '${OUTPUT_DIR}'
+        if [[ '$WORKDIR' != '$OUTPUT_DIR' ]]; then
+            df -h '${WORKDIR}'
+        fi
+        du -sh \"\${CS_STAGING}\" 2>/dev/null || true
 
         # mksquashfs adds each source directory as a named subdirectory — it does
         # NOT union-merge multiple sources into root. To get the VFS storage at
         # /var/lib/containers/storage/ in the squashfs (not at /dakota-cs-staging/...),
-        # we build a single unified source tree using XFS reflinks (instant, ~zero space).
-        echo 'Building unified squashfs source tree...'
+        # we build a single unified source tree using overlayfs + bind mounts.
+        echo 'Building unified squashfs source tree using bind mounts...'
         mkdir -p \"\${SQUASHFS_ROOT}\"
-        cp -a --reflink=auto \"\${MOUNT}/.\" \"\${SQUASHFS_ROOT}/\" 2>/dev/null || \
+
+        FS_TYPE=\$(findmnt -n -o FSTYPE -T \"\${SQUASHFS_ROOT}\" 2>/dev/null || echo \"unknown\")
+        if [[ \"\${FS_TYPE}\" == \"xfs\" || \"\${FS_TYPE}\" == \"ext4\" ]]; then
+            echo \"Filesystem is \${FS_TYPE}, trying overlay\"
+            if ! mount -t overlay overlay \
+                -o lowerdir=\"\${MOUNT}\",upperdir=\"\${OVERLAY_UPPER}\",workdir=\"\${OVERLAY_WORK}\" \"\${SQUASHFS_ROOT}\"; then
+                echo \"Overlay mount failed on \${FS_TYPE}; falling back to cp -a\"
+                cp -a \"\${MOUNT}/.\" \"\${SQUASHFS_ROOT}/\"
+            fi
+        else
+            echo \"Filesystem is \${FS_TYPE}, doing it the boring way\"
             cp -a \"\${MOUNT}/.\" \"\${SQUASHFS_ROOT}/\"
-        # Merge VFS storage into the correct path within the unified source tree.
+        fi
+
+        # Bind mount the container storage into the squashfs at the correct path
         mkdir -p \"\${SQUASHFS_ROOT}/var/lib/containers/storage\"
-        cp -a \"\${CS_STAGING}/var/lib/containers/storage/.\" \
-            \"\${SQUASHFS_ROOT}/var/lib/containers/storage/\"
-        rm -rf \"\${CS_STAGING}\"
+
+        mount --bind \"\${CS_STAGING}/var/lib/containers/storage\" \"\${SQUASHFS_ROOT}/var/lib/containers/storage\"
+        echo '=== Disk space after creation of squashfs root ==='
+        df -h '${OUTPUT_DIR}'
+        if [[ '$WORKDIR' != '$OUTPUT_DIR' ]]; then
+            df -h '${WORKDIR}'
+        fi
+        du -sh \"\${SQUASHFS_ROOT}\" 2>/dev/null || true
 
         # Build squashfs from the unified source tree.
         # dedup removes blocks shared between live rootfs and OCI layers (same base image).
@@ -160,17 +308,16 @@ iso-sd-boot target:
             -processors 4 \
             -e proc -e sys -e dev -e run -e tmp
 
-        # Clean up staging dirs inside unshare — vfs files are owned by sub-uids
-        # and cannot be removed by the real user outside the user namespace.
-        rm -rf \"\${SQUASHFS_ROOT}\"
-
         # Export only boot files needed for ESP assembly
         tar -C \"\$MOUNT\" \
             -cf '${BOOT_TAR}' \
             ./usr/lib/modules \
             ./usr/lib/systemd/boot/efi
-        podman image umount localhost/{{target}}-installer
     "
+
+    echo "=== Disk space after squashfs, before ISO assembly ==="
+    df -h "${OUTPUT_DIR}"
+    du -sh "${SQUASHFS}" "${BOOT_TAR}" 2>/dev/null || true
 
     # Run build-iso.sh directly on the host — no container needed.
     # All required tools (xorriso, mkfs.fat, mtools) are present.
@@ -178,12 +325,53 @@ iso-sd-boot target:
     # just always runs recipes from the justfile directory, so relative path works.
     TMPDIR="${OUTPUT_DIR}" \
     PATH="/usr/sbin:/usr/bin:/home/linuxbrew/.linuxbrew/bin:${PATH}" \
-        bash "{{target}}/src/build-iso.sh" "${BOOT_TAR}" "${SQUASHFS}" "${OUTPUT_DIR}/{{target}}-live.iso"
+        bash "dakota/src/build-iso.sh" "${BOOT_TAR}" "${SQUASHFS}" "${OUTPUT_DIR}/{{target}}-live.iso"
 
     echo "ISO ready: ${OUTPUT_DIR}/{{target}}-live.iso"
 
 iso target:
     {{image-builder}} build --bootc-ref localhost/{{target}}-installer --bootc-default-fs ext4 `just _payload_ref_flag {{target}}` bootc-generic-iso
+
+# Run chunkah content-based layer splitting against a source image and push to a destination.
+#
+# Pulls the source image, runs chunkah to produce a zstd:chunked OCI archive,
+# loads the result into podman, and pushes it to the destination ref.
+#
+# Usage:
+#   just chunkify ghcr.io/projectbluefin/dakota:latest 192.168.122.1:5000/dakota:chunked
+#   just chunkify ghcr.io/projectbluefin/dakota:latest ghcr.io/projectbluefin/dakota:chunked
+chunkify src dst:
+    #!/usr/bin/bash
+    set -euo pipefail
+
+    echo "==> Pulling source image: {{src}}"
+    podman pull {{src}}
+
+    echo "==> Running chunkah on {{src}}..."
+    # Use /var (not /tmp) — the OCI archive can exceed the tmpfs size for large images
+    CHUNK_OUT=$(mktemp -d --tmpdir=/var/tmp)
+    trap 'rm -rf "${CHUNK_OUT}"' EXIT
+
+    podman run --rm \
+        --security-opt label=disable \
+        --entrypoint="" \
+        -v "${CHUNK_OUT}:/run/out:Z" \
+        --mount "type=image,source={{src}},target=/chunkah" \
+        ghcr.io/tuna-os/chunkah:latest \
+        sh -c 'chunkah build > /run/out/out.ociarchive'
+
+    echo "==> Loading rechunked archive..."
+    LOADED_ID=$(podman load --input "${CHUNK_OUT}/out.ociarchive" | awk '/Loaded image/{print $NF}')
+    if [[ -z "${LOADED_ID}" ]]; then
+        echo "ERROR: podman load produced no image ID; the OCI archive may be corrupt or disk full" >&2
+        exit 1
+    fi
+
+    echo "==> Tagging and pushing to {{dst}}..."
+    podman tag "${LOADED_ID}" "{{dst}}"
+    podman push --tls-verify=false "{{dst}}"
+
+    echo "==> Done: {{dst}}"
 
 # We need some patches that are not yet available upstream, so let's build a custom version.
 build-image-builder:
@@ -298,6 +486,10 @@ dev target:
 boot-iso-serial target:
     #!/usr/bin/bash
     set -euo pipefail
+    QEMU=$(command -v /usr/libexec/qemu-kvm /usr/bin/qemu-kvm \
+               /usr/bin/qemu-system-x86_64 \
+               /home/linuxbrew/.linuxbrew/bin/qemu-system-x86_64 2>/dev/null | head -1)
+    [[ -z "$QEMU" ]] && { echo "qemu-kvm / qemu-system-x86_64 not found" >&2; exit 1; }
     ISO=$(ls \
         {{output_dir}}/{{target}}-live.iso \
         output/bootiso/install.iso \
@@ -314,7 +506,8 @@ boot-iso-serial target:
         /usr/share/OVMF/OVMF_CODE.fd \
         /usr/share/edk2/ovmf/OVMF_CODE.fd \
         /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
-        /usr/share/ovmf/OVMF.fd; do
+        /usr/share/ovmf/OVMF.fd \
+        /home/linuxbrew/.linuxbrew/Cellar/qemu/11.0.0/share/qemu/edk2-x86_64-code.fd; do
         [[ -f "$f" ]] && { OVMF_CODE="$f"; break; }
     done
     OVMF_VARS_SRC=""
@@ -336,7 +529,7 @@ boot-iso-serial target:
 
     echo "Booting ${ISO} via UEFI — serial console below (Ctrl-A X to quit)"
     echo "SSH available on localhost:2222 (user: liveuser, password: live) if built with debug=1"
-    sudo /usr/libexec/qemu-kvm \
+    "$QEMU" \
         -machine q35 \
         -m 4096 \
         -accel kvm \
@@ -383,7 +576,8 @@ boot-libvirt-debug target:
         /usr/share/OVMF/OVMF_CODE.fd \
         /usr/share/edk2/ovmf/OVMF_CODE.fd \
         /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
-        /usr/share/ovmf/OVMF.fd; do
+        /usr/share/ovmf/OVMF.fd \
+        /home/linuxbrew/.linuxbrew/Cellar/qemu/11.0.0/share/qemu/edk2-x86_64-code.fd; do
         [[ -f "$f" ]] && { OVMF_CODE="$f"; break; }
     done
     OVMF_VARS=""
@@ -460,3 +654,409 @@ boot-libvirt-debug target:
     echo "VNC: $(sudo virsh domdisplay ${VM_NAME} 2>/dev/null || echo 'unavailable')"
     echo "Serial: sudo virsh console ${VM_NAME}"
     echo "Cleanup: sudo virsh destroy ${VM_NAME} && sudo virsh undefine ${VM_NAME} --nvram"
+
+# Reproduce issue #270: install Dakota with LUKS encryption via fisherman into
+# the running dakota-debug libvirt VM, then eject the ISO and reboot.
+#
+# Prerequisites:
+#   1. Build a debug ISO:  just debug=1 installer_channel=dev iso-sd-boot dakota
+#   2. Boot the VM:        just debug=1 boot-libvirt-debug dakota
+#      (wait for "SSH ready" output, then Ctrl-C or let it return)
+#
+# After install this recipe ejects the ISO and issues a reboot so the VM boots
+# into the freshly installed system.  Observe the boot with: just luks-boot dakota
+#
+# The LUKS passphrase defaults to "testpassphrase"; override with:
+#   just luks-passphrase=MySecret luks-install dakota
+luks-install target:
+    #!/usr/bin/bash
+    set -euo pipefail
+
+    VM_NAME="dakota-debug"
+    PASSPHRASE="{{luks-passphrase}}"
+    DISK="/dev/sda"
+    PAYLOAD_IMAGE=$(cat "{{target}}/payload_ref" | tr -d '[:space:]')
+    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o IdentitiesOnly=yes -o PreferredAuthentications=password"
+    SSH="sshpass -p live ssh $SSH_OPTS"
+    SCP="sshpass -p live scp $SSH_OPTS"
+
+    # ── Resolve guest IP from DHCP leases ────────────────────────────────────
+    MAC=$(sudo virsh domiflist "$VM_NAME" 2>/dev/null | awk '/network/{print $5; exit}')
+    if [[ -z "$MAC" ]]; then
+        echo "ERROR: VM '${VM_NAME}' is not running."
+        echo "Start it first: just debug=1 boot-libvirt-debug {{target}}"
+        exit 1
+    fi
+
+    GUEST_IP=""
+    echo "Looking up DHCP lease for ${VM_NAME} (${MAC})..."
+    for i in $(seq 1 20); do
+        GUEST_IP=$(sudo virsh net-dhcp-leases default 2>/dev/null \
+            | awk -v mac="$MAC" '$3 == mac {split($5, a, "/"); print a[1]}' \
+            | head -1)
+        [[ -n "$GUEST_IP" ]] && break
+        sleep 3
+    done
+    if [[ -z "$GUEST_IP" ]]; then
+        echo "ERROR: no DHCP lease found — is the VM fully booted?"
+        echo "Check: sudo virsh net-dhcp-leases default"
+        exit 1
+    fi
+    echo "Guest IP: ${GUEST_IP}"
+
+    # ── Wait for SSH ──────────────────────────────────────────────────────────
+    echo "Waiting for SSH..."
+    for i in $(seq 1 30); do
+        $SSH liveuser@"$GUEST_IP" true 2>/dev/null && break
+        sleep 3
+    done
+    $SSH liveuser@"$GUEST_IP" true || { echo "ERROR: SSH timed out"; exit 1; }
+
+    # ── Upload fisherman recipe ───────────────────────────────────────────────
+    # Use containers-storage so fisherman uses the OCI image already embedded in
+    # the squashfs (no network pull needed; matches what the GUI installer does).
+    # Write to a local temp file first to avoid $() heredoc syntax that confuses
+    # just's parser (it sees the closing ) at column 0 as a delimiter).
+    RECIPE_TMP=$(mktemp /tmp/luks-recipe-XXXXXX.json)
+    trap "rm -f '${RECIPE_TMP}'" EXIT
+    printf '{\n  "disk": "%s",\n  "filesystem": "btrfs",\n  "image": "containers-storage:'"${PAYLOAD_IMAGE}"'",\n  "composeFsBackend": true,\n  "bootloader": "systemd",\n  "hostname": "dakota-luks-test",\n  "encryption": {"type": "luks-passphrase", "passphrase": "%s"},\n  "flatpaks": []\n}\n' \
+        "${DISK}" "${PASSPHRASE}" > "${RECIPE_TMP}"
+    $SCP "${RECIPE_TMP}" liveuser@"$GUEST_IP":/tmp/luks-recipe.json
+    echo "Uploaded recipe to /tmp/luks-recipe.json"
+
+    # ── Run fisherman ─────────────────────────────────────────────────────────
+    # fisherman is symlinked at /usr/local/bin/fisherman by configure-live.sh.
+    # Run as root (liveuser has NOPASSWD sudo) so fisherman can partition disks.
+    echo "Running fisherman install (this takes several minutes)..."
+    $SSH liveuser@"$GUEST_IP" 'sudo /usr/local/bin/fisherman /tmp/luks-recipe.json'
+    echo "Install finished."
+
+    # ── Eject ISO and reboot ──────────────────────────────────────────────────
+    echo "Ejecting install ISO..."
+    CDROM_DEV=$(sudo virsh domblklist "$VM_NAME" \
+        | awk 'NR>2 && ($2 ~ /\.iso$/ || $2 == "-") {print $1; exit}')
+    if [[ -n "$CDROM_DEV" ]]; then
+        sudo virsh change-media "$VM_NAME" "$CDROM_DEV" --eject --force 2>/dev/null || true
+        echo "ISO ejected from ${CDROM_DEV}."
+    else
+        echo "Warning: could not identify CD-ROM device; eject skipped."
+    fi
+
+    echo "Rebooting VM into installed system..."
+    sudo virsh reboot "$VM_NAME" || $SSH liveuser@"$GUEST_IP" 'sudo reboot' || true
+
+    echo ""
+    echo "========================================"
+    echo " VM is rebooting into the installed system."
+    echo " Unlock LUKS: just luks-unlock {{target}}"
+    echo " Watch boot:  just luks-boot {{target}}"
+    echo " Reproduces:  projectbluefin/dakota#270"
+    echo "========================================"
+
+# Automate LUKS passphrase entry on the dakota-debug VM serial console.
+#
+# Uses a Python PTY to connect to the VM's serial console, waits for the
+# cryptsetup passphrase prompt, sends the passphrase, then watches the boot
+# for success or the #270 emergency shell.
+#
+# Run after: just luks-install dakota
+# Passphrase defaults to {{luks-passphrase}}; override with luks-passphrase=X
+luks-unlock target:
+    #!/usr/bin/bash
+    VM_NAME="dakota-debug"
+    PASSPHRASE="{{luks-passphrase}}"
+    if ! sudo virsh domstate "$VM_NAME" 2>/dev/null | grep -q running; then
+        echo "ERROR: VM '${VM_NAME}' is not running."
+        echo "Run: just luks-install {{target}}"
+        exit 1
+    fi
+    MAC=$(sudo virsh domiflist "$VM_NAME" 2>/dev/null | awk '/network/{print $5; exit}')
+    if [[ -z "$MAC" ]]; then
+        echo "ERROR: VM '${VM_NAME}' is not running."
+        exit 1
+    fi
+    echo "Waiting for Plymouth passphrase prompt (VM MAC: ${MAC})..."
+    echo "Passphrase: ${PASSPHRASE}"
+    sudo python3 "dakota/src/luks-unlock.py" libvirt "$VM_NAME" "$PASSPHRASE" "$MAC"
+
+# Connect to the serial console of the dakota-debug VM to watch boot after
+# luks-install.  At the LUKS passphrase prompt type the passphrase (default:
+# "testpassphrase"), then watch for the systemd emergency shell (issue #270).
+#
+# Detach: Ctrl-]
+# Cleanup after testing:
+#   sudo virsh destroy dakota-debug && sudo virsh undefine dakota-debug --nvram
+luks-boot target:
+    #!/usr/bin/bash
+    VM_NAME="dakota-debug"
+    if ! sudo virsh domstate "$VM_NAME" 2>/dev/null | grep -q running; then
+        echo "ERROR: VM '${VM_NAME}' is not running."
+        echo "Run: just luks-install {{target}}"
+        exit 1
+    fi
+    echo "Connecting to serial console (detach: Ctrl-])"
+    echo "At the LUKS passphrase prompt type: {{luks-passphrase}}"
+    echo "Reproducing: projectbluefin/dakota#270"
+    echo "  Expected:  ~90s hang → systemd emergency shell"
+    echo ""
+    sudo virsh console "$VM_NAME"
+
+# ── QEMU-native LUKS test (used by CI; mirrors the libvirt recipes) ───────────
+#
+# These recipes run the same end-to-end LUKS test as the libvirt workflow but
+# use QEMU directly so they work in GitHub Actions (no libvirt available).
+#
+# Full CI test sequence:
+#   just debug=1 installer_channel=dev iso-sd-boot dakota
+#   just luks-test-qemu dakota
+#
+# Or step-by-step:
+#   just luks-boot-qemu-live dakota   # boot live ISO in QEMU (daemonized)
+#   just luks-install-qemu dakota     # SSH fisherman install (uses luks-install internals)
+#   just luks-boot-qemu-installed dakota  # reboot QEMU into installed disk
+#   just luks-unlock-qemu dakota      # send passphrase via QEMU monitor
+
+# QEMU install disk path (override with: just luks-qemu-disk=/path/to/disk.qcow2 ...)
+luks-qemu-disk := "/var/tmp/dakota-luks-install.qcow2"
+
+# QEMU monitor socket paths
+luks-qemu-monitor-live := "/tmp/dakota-qemu-live.sock"
+luks-qemu-monitor-installed := "/tmp/dakota-qemu-installed.sock"
+
+# Serial log paths
+luks-qemu-serial-live := "/tmp/dakota-qemu-live-serial.log"
+luks-qemu-serial-installed := "/tmp/dakota-qemu-installed-serial.log"
+
+# SSH port for QEMU SLIRP forwarding
+luks-qemu-ssh-port := "2222"
+
+# Full end-to-end test: build the ISO then run the LUKS install + boot test.
+# This is the primary integration test — mirrors .github/workflows/test-luks-install.yml.
+# Usage: just debug=1 installer_channel=dev    e2e dakota
+#        just debug=1 installer_channel=stable e2e dakota
+e2e target:
+    #!/usr/bin/bash
+    set -euo pipefail
+    echo "=== Step 1/2: Building ISO (debug={{debug}}, installer_channel={{installer_channel}}) ==="
+    just debug={{debug}} installer_channel={{installer_channel}} output_dir={{output_dir}} iso-sd-boot {{target}}
+    echo "=== Step 2/2: LUKS end-to-end test ==="
+    sudo rm -f "{{luks-qemu-disk}}" "{{luks-qemu-monitor-live}}" "{{luks-qemu-monitor-installed}}" \
+               "{{luks-qemu-serial-live}}" "{{luks-qemu-serial-installed}}"
+    just luks-test-qemu {{target}}
+
+# Run the full LUKS end-to-end test in QEMU (CI entry point).
+# Builds nothing — expects the ISO to already exist in {{output_dir}}.
+luks-test-qemu target:
+    #!/usr/bin/bash
+    set -euo pipefail
+    just luks-qemu-disk={{luks-qemu-disk}} luks-boot-qemu-live {{target}}
+    just luks-qemu-ssh-port={{luks-qemu-ssh-port}} luks-install-qemu {{target}}
+    just luks-qemu-disk={{luks-qemu-disk}} luks-boot-qemu-installed {{target}}
+    just luks-qemu-monitor-installed={{luks-qemu-monitor-installed}} \
+         luks-qemu-serial-installed={{luks-qemu-serial-installed}} \
+         luks-unlock-qemu {{target}}
+
+# Boot the live ISO in QEMU (daemonized) with a blank install disk attached.
+# Creates the install disk if it doesn't exist.
+luks-boot-qemu-live target:
+    #!/usr/bin/bash
+    set -euo pipefail
+    QEMU=$(command -v /usr/libexec/qemu-kvm /usr/bin/qemu-kvm \
+               /usr/bin/qemu-system-x86_64 \
+               /home/linuxbrew/.linuxbrew/bin/qemu-system-x86_64 2>/dev/null | head -1)
+    [[ -z "$QEMU" ]] && { echo "qemu-kvm / qemu-system-x86_64 not found" >&2; exit 1; }
+    ISO=$(ls \
+        {{output_dir}}/{{target}}-live.iso \
+        output/bootiso/install.iso \
+        output/bootc-{{target}}*.iso \
+        2>/dev/null | head -1 || true)
+    if [[ -z "$ISO" ]]; then
+        echo "No ISO found — run: just debug=1 iso-sd-boot {{target}}" >&2
+        exit 1
+    fi
+
+    OVMF_CODE=""; OVMF_VARS=""
+    for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
+              /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd \
+              /home/linuxbrew/.linuxbrew/Cellar/qemu/11.0.0/share/qemu/edk2-x86_64-code.fd; do
+        [[ -f "$f" ]] && { OVMF_CODE="$f"; break; }
+    done
+    for f in /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd \
+              /usr/share/edk2/ovmf/OVMF_VARS.fd; do
+        if [[ -f "$f" ]]; then cp "$f" /var/tmp/dakota-qemu-live-vars.fd; OVMF_VARS=/var/tmp/dakota-qemu-live-vars.fd; break; fi
+    done
+    [[ -z "$OVMF_CODE" ]] && { echo "OVMF firmware not found" >&2; exit 1; }
+
+    [[ -f "{{luks-qemu-disk}}" ]] || qemu-img create -f qcow2 "{{luks-qemu-disk}}" 64G
+    sudo rm -f "{{luks-qemu-monitor-live}}" "{{luks-qemu-serial-live}}"
+
+    echo "Booting live ISO: $ISO"
+    # KVM access: try direct, then sudo, then fall back to TCG
+    QEMU_ACCEL="-accel kvm"
+    QEMU_PREFIX=""
+    if ! test -r /dev/kvm 2>/dev/null; then
+        if sudo test -r /dev/kvm 2>/dev/null; then
+            echo "Using sudo for KVM access"
+            QEMU_PREFIX="sudo"
+        else
+            echo "KVM not available, falling back to TCG emulation (slower)"
+            QEMU_ACCEL="-accel tcg,thread=multi"
+            QEMU_PREFIX=""
+        fi
+    fi
+    $QEMU_PREFIX "$QEMU" \
+        -machine q35 -cpu host -m 8192 -smp 4 $QEMU_ACCEL \
+        -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}" \
+        -drive "if=pflash,format=raw,file=${OVMF_VARS}" \
+        -drive "if=none,id=iso,file=${ISO},media=cdrom,readonly=on,format=raw" \
+        -device virtio-scsi-pci,id=scsi \
+        -device scsi-cd,drive=iso \
+        -drive "if=none,id=disk,file={{luks-qemu-disk}},format=qcow2" \
+        -device virtio-blk-pci,drive=disk \
+        -netdev "user,id=net0,hostfwd=tcp::{{luks-qemu-ssh-port}}-:22" \
+        -device virtio-net-pci,netdev=net0 \
+        -monitor "unix:{{luks-qemu-monitor-live}},server,nowait" \
+        -serial "file:{{luks-qemu-serial-live}}" \
+        -display none \
+        -daemonize
+    echo "Live QEMU started (monitor: {{luks-qemu-monitor-live}})"
+
+    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o PreferredAuthentications=password"
+    echo "Waiting for live environment on port {{luks-qemu-ssh-port}}..."
+    # Check for DAKOTA_LIVE_READY serial marker OR SSH connectivity.
+    # The serial marker requires live-ready.service to print to journal+console.
+    # On some installer channel builds (e.g. dev) the service starts but never
+    # writes to the serial console; SSH still works because debug-ssh-banner
+    # confirms sshd is up.  Either path means the live env is ready.
+    for i in $(seq 1 60); do
+        if sudo grep -q "DAKOTA_LIVE_READY" "{{luks-qemu-serial-live}}" 2>/dev/null; then
+            echo "Live environment ready (serial marker seen)"
+            break
+        fi
+        if sshpass -p live ssh $SSH_OPTS liveuser@127.0.0.1 -p {{luks-qemu-ssh-port}} true 2>/dev/null; then
+            echo "Live environment ready (SSH connected)"
+            break
+        fi
+        [[ "$i" -eq 60 ]] && { echo "ERROR: live env not ready after 5m"; sudo tail -30 "{{luks-qemu-serial-live}}" || true; exit 1; }
+        sleep 5
+    done
+
+    # Save a live boot screendump for CI diagnostics / PR comment
+    sleep 2
+    sudo socat - "UNIX-CONNECT:{{luks-qemu-monitor-live}}" \
+        <<< "screendump /tmp/luks-screenshot-live.ppm" 2>/dev/null || true
+
+# Run fisherman LUKS install via SSH into the live QEMU VM.
+# Reuses the same SSH logic as luks-install; install disk is /dev/vda in QEMU.
+luks-install-qemu target:
+    #!/usr/bin/bash
+    set -euo pipefail
+    PASSPHRASE="{{luks-passphrase}}"
+    DISK="/dev/vda"
+    PAYLOAD_IMAGE=$(cat "{{target}}/payload_ref" | tr -d '[:space:]')
+    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o PreferredAuthentications=password -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+    SSH="sshpass -p live ssh $SSH_OPTS liveuser@127.0.0.1 -p {{luks-qemu-ssh-port}}"
+    SCP="sshpass -p live scp $SSH_OPTS -P {{luks-qemu-ssh-port}}"
+
+    RECIPE_TMP=$(mktemp /tmp/luks-recipe-XXXXXX.json)
+    trap "rm -f '${RECIPE_TMP}'" EXIT
+    printf '{\n  "disk": "%s",\n  "filesystem": "btrfs",\n  "image": "containers-storage:'"${PAYLOAD_IMAGE}"'",\n  "composeFsBackend": true,\n  "bootloader": "systemd",\n  "hostname": "dakota-luks-test",\n  "encryption": {"type": "luks-passphrase", "passphrase": "%s"},\n  "flatpaks": []\n}\n' \
+        "${DISK}" "${PASSPHRASE}" > "${RECIPE_TMP}"
+    $SCP "${RECIPE_TMP}" liveuser@127.0.0.1:/tmp/luks-recipe.json
+    echo "Uploaded recipe — running fisherman (takes several minutes)..."
+    $SSH 'sudo /usr/local/bin/fisherman /tmp/luks-recipe.json'
+    echo "Patching BLS entries to enable dual serial+VT console..."
+    $SSH 'sudo bash -c "
+        set -euo pipefail
+        TMP=$(mktemp -d)
+        trap \"umount \$TMP 2>/dev/null || true; rmdir \$TMP\" EXIT
+        mount /dev/vda1 \$TMP
+        COUNT=0
+        for entry in \$TMP/loader/entries/*.conf \$TMP/EFI/loader/entries/*.conf; do
+            [[ -f \"\$entry\" ]] || continue
+            if grep -q \"^options \" \"\$entry\" && ! grep -q \"console=tty0\" \"\$entry\"; then
+                sed -i \"s|^options .*|& console=tty0 console=ttyS0|\" \"\$entry\"
+                COUNT=\$((COUNT+1))
+                echo \"  patched: \$(basename \$entry)\"
+            fi
+        done
+        echo \"BLS patch: \$COUNT entries updated\"
+    "'
+    echo "Install complete. Shutting down live QEMU..."
+    echo "system_powerdown" | sudo socat - "UNIX-CONNECT:{{luks-qemu-monitor-live}}" 2>/dev/null || true
+    sleep 5
+    echo "quit" | sudo socat - "UNIX-CONNECT:{{luks-qemu-monitor-live}}" 2>/dev/null || true
+
+# Boot the installed disk in QEMU (no ISO). Called after luks-install-qemu.
+luks-boot-qemu-installed target:
+    #!/usr/bin/bash
+    set -euo pipefail
+    QEMU=$(command -v /usr/libexec/qemu-kvm /usr/bin/qemu-kvm \
+               /usr/bin/qemu-system-x86_64 \
+               /home/linuxbrew/.linuxbrew/bin/qemu-system-x86_64 2>/dev/null | head -1)
+    [[ -z "$QEMU" ]] && { echo "qemu-kvm / qemu-system-x86_64 not found" >&2; exit 1; }
+    OVMF_CODE=""; OVMF_VARS=""
+    for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
+              /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd \
+              /home/linuxbrew/.linuxbrew/Cellar/qemu/11.0.0/share/qemu/edk2-x86_64-code.fd; do
+        [[ -f "$f" ]] && { OVMF_CODE="$f"; break; }
+    done
+    for f in /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd \
+              /usr/share/edk2/ovmf/OVMF_VARS.fd; do
+        if [[ -f "$f" ]]; then cp "$f" /var/tmp/dakota-qemu-installed-vars.fd; OVMF_VARS=/var/tmp/dakota-qemu-installed-vars.fd; break; fi
+    done
+    [[ -z "$OVMF_CODE" ]] && { echo "OVMF firmware not found" >&2; exit 1; }
+
+    sudo rm -f "{{luks-qemu-monitor-installed}}" "{{luks-qemu-serial-installed}}"
+
+    echo "Booting installed disk: {{luks-qemu-disk}}"
+    # KVM access: try direct, then sudo, then fall back to TCG
+    QEMU_ACCEL="-accel kvm"
+    QEMU_PREFIX=""
+    if ! test -r /dev/kvm 2>/dev/null; then
+        if sudo test -r /dev/kvm 2>/dev/null; then
+            echo "Using sudo for KVM access"
+            QEMU_PREFIX="sudo"
+        else
+            echo "KVM not available, falling back to TCG emulation (slower)"
+            QEMU_ACCEL="-accel tcg,thread=multi"
+            QEMU_PREFIX=""
+        fi
+    fi
+    $QEMU_PREFIX "$QEMU" \
+        -machine q35 -cpu host -m 8192 -smp 4 $QEMU_ACCEL \
+        -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}" \
+        -drive "if=pflash,format=raw,file=${OVMF_VARS}" \
+        -drive "if=none,id=disk,file={{luks-qemu-disk}},format=qcow2" \
+        -device virtio-blk-pci,drive=disk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
+        -monitor "unix:{{luks-qemu-monitor-installed}},server,nowait" \
+        -serial "file:{{luks-qemu-serial-installed}}" \
+        -display none \
+        -daemonize
+    echo "Installed QEMU started (monitor: {{luks-qemu-monitor-installed}})"
+
+    for i in $(seq 1 15); do
+        [[ -S "{{luks-qemu-monitor-installed}}" ]] && break
+        sleep 2
+    done
+
+# Send LUKS passphrase to installed QEMU VM via monitor screendump + sendkey.
+# Polls screendump size to detect Plymouth takeover, then injects keystrokes.
+luks-unlock-qemu target:
+    #!/usr/bin/bash
+    set -euo pipefail
+    PASSPHRASE="{{luks-passphrase}}"
+    echo "Unlocking LUKS on installed QEMU VM..."
+    echo "Passphrase: ${PASSPHRASE}"
+    sudo python3 "dakota/src/luks-unlock.py" qemu \
+        "{{luks-qemu-monitor-installed}}" \
+        "$PASSPHRASE" \
+        "{{luks-qemu-serial-installed}}"
+
+    # Show key screenshots inline for terminals that support it (Kitty, iTerm2, etc.)
+    for label in "Plymouth prompt" "Final boot"; do
+        key=$(echo "$label" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+        bash "dakota/src/show-screenshot.sh" "/tmp/luks-screenshot-${key}.ppm" "$label" || true
+    done

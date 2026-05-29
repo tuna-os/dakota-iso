@@ -40,8 +40,6 @@ if [[ "${DEBUG:-0}" == "1" ]]; then
 
     # Grant passwordless sudo via sudoers drop-in (usermod -aG wheel doesn't
     # persist reliably through the squashfs overlay at runtime).
-    echo "liveuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/liveuser
-    chmod 440 /etc/sudoers.d/liveuser
 
     # Enable sshd: the Dakota/Bluefin preset marks sshd disabled, so a plain
     # wants symlink gets overridden at first boot.  A preset file in
@@ -206,6 +204,33 @@ WantedBy=local-fs.target
 UNITEOF
 systemctl enable var-tmp.mount
 
+# ── Live-ready marker service ─────────────────────────────────────────────────
+# Prints DAKOTA_LIVE_READY to the serial console after display-manager.service
+# starts.  CI boot verification greps for this token in the serial log.
+#
+# StandardOutput=tty + TTYPath=/dev/ttyS0 ensures the echo goes to the serial
+# device directly.  StandardOutput=journal+console routes to /dev/console which
+# is NOT the serial device in headless QEMU (-display none, -serial file:...).
+#
+# WantedBy=multi-user.target (not display-manager.service) ensures reliable
+# enablement; After=display-manager.service provides ordering only.
+cat > /usr/lib/systemd/system/live-ready.service << 'LREOF'
+[Unit]
+Description=Live environment ready marker
+After=display-manager.service
+Requires=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/echo DAKOTA_LIVE_READY
+StandardOutput=tty
+TTYPath=/dev/ttyS0
+
+[Install]
+WantedBy=multi-user.target
+LREOF
+systemctl enable live-ready.service
+
 # fisherman (tuna-installer backend) creates /var/fisherman-tmp and bind-mounts
 # it to /var/tmp.  Pre-create the directory so it exists at boot time.
 mkdir -p /var/fisherman-tmp
@@ -220,6 +245,11 @@ done
 # Symlink 512×512 to pixmaps for compatibility
 install -Dm644 "$SCRIPT_DIR/icons/hicolor/512x512/apps/dakota.png" /usr/share/pixmaps/dakota.png
 gtk-update-icon-cache /usr/share/icons/hicolor/
+
+# ── Installer tour images ─────────────────────────────────────────────────────
+# The tuna-installer Flatpak has --filesystem=host so absolute paths are visible.
+mkdir -p /usr/share/bootc-installer/images
+install -Dm644 "$SCRIPT_DIR/images/dakotaraptor.png" /usr/share/bootc-installer/images/dakotaraptor.png
 
 # ── Installer configuration ───────────────────────────────────────────────────
 # The bootc-installer reads both overrides from /etc/bootc-installer/:
@@ -238,13 +268,13 @@ INSTALLER_APP_ID="org.bootcinstaller.Installer"
 [[ "${INSTALLER_CHANNEL:-stable}" == "dev" ]] && INSTALLER_APP_ID="org.bootcinstaller.Installer.Devel"
 
 mkdir -p /etc/xdg/autostart
-# VANILLA_CUSTOM_RECIPE workaround (tuna-os/tuna-installer#26): inside the
+# BOOTC_CUSTOM_RECIPE workaround (tuna-os/tuna-installer#26): inside the
 # Flatpak sandbox /etc is reserved; the host /etc is at /run/host/etc.  Pass
 # the recipe via env var at the /run/host path so the installer finds it.
 cat > /etc/xdg/autostart/tuna-installer.desktop << DTEOF
 [Desktop Entry]
 Name=Dakota Installer
-Exec=flatpak run --env=VANILLA_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
+Exec=flatpak run --env=BOOTC_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
 Icon=dakota
 Type=Application
 X-GNOME-Autostart-enabled=true
@@ -258,7 +288,7 @@ cat > /usr/share/applications/dakota-installer.desktop << DTEOF
 [Desktop Entry]
 Name=Dakota Installer
 Comment=Install Dakota to your computer
-Exec=flatpak run --env=VANILLA_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
+Exec=flatpak run --env=BOOTC_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
 Icon=dakota
 Type=Application
 Categories=System;
@@ -348,65 +378,5 @@ runroot = "/run/containers/storage"
 graphroot = "/var/lib/containers/storage"
 STOREOF
 
-# ── Skopeo / Podman wrappers for offline install ─────────────────────────────
-# fisherman (the tuna-installer backend) calls skopeo to export the embedded
-# VFS image to OCI, then podman to run `bootc install to-filesystem`.
-#
-# Two problems on a live ISO:
-#   1. fisherman passes `containers-storage:containers-storage:IMAGE` (doubled
-#      prefix) — upstream bug in fisherman's bootc.go; the wrapper strips it.
-#   2. The live rootfs overlay is tiny (~1.6 GiB).  Both skopeo temp files
-#      (container_images_*, ~8 GiB) and bootc's VFS layer writes (~8 GiB)
-#      overflow it.  The wrapper redirects writes to a btrfs @scratch
-#      subvolume on the *target* disk (already partitioned and mounted by
-#      fisherman at this point) via bind mounts and an overlayfs on
-#      /var/lib/containers/storage.  The @scratch subvolume is mounted as a
-#      mount point on the target, which bootc's "empty rootfs" check allows.
-
-# Back up real binaries
-cp /usr/bin/skopeo /usr/bin/skopeo.real
-cp /usr/bin/podman /usr/bin/podman.real
-
-cat > /usr/bin/skopeo << 'SKOPEOF'
-#!/bin/bash
-ARGS=()
-for arg in "$@"; do
-    ARGS+=("${arg/containers-storage:containers-storage:/containers-storage:}")
-done
-
-for target in /mnt/fisherman-target /var/mnt/fisherman-target; do
-    if mountpoint -q "$target" 2>/dev/null; then
-        SCRATCH="$target/@scratch"
-        if [ ! -d "$SCRATCH" ]; then
-            btrfs subvolume create "$SCRATCH"
-        fi
-        DEV=$(findmnt -n -o SOURCE "$target" | head -1)
-        mount -o subvol=@scratch "$DEV" "$SCRATCH"
-
-        mkdir -p "$SCRATCH/var-tmp"
-        mount --bind "$SCRATCH/var-tmp" /var/tmp
-        # Also redirect /var/fisherman-tmp so podman's -v bind sees the OCI cache
-        if [ -d /var/fisherman-tmp ]; then
-            mount --bind "$SCRATCH/var-tmp" /var/fisherman-tmp
-        fi
-
-        CS=/var/lib/containers/storage
-        LOWER=/run/rootfsbase/var/lib/containers/storage
-        if [ -d "$LOWER" ] && ! mountpoint -q "$CS" 2>/dev/null; then
-            mkdir -p "$SCRATCH/cs-upper" "$SCRATCH/cs-work"
-            mount -t overlay overlay \
-                -o "lowerdir=$LOWER,upperdir=$SCRATCH/cs-upper,workdir=$SCRATCH/cs-work" \
-                "$CS"
-        fi
-        break
-    fi
-done
-exec /usr/bin/skopeo.real "${ARGS[@]}"
-SKOPEOF
-chmod +x /usr/bin/skopeo
-
-cat > /usr/bin/podman << 'PODMEOF'
-#!/bin/bash
-exec /usr/bin/podman.real "$@"
-PODMEOF
-chmod +x /usr/bin/podman
+# fisherman handles scratch space, transport-prefix stripping, OCI export, and
+# GPT partition retagging natively — no host-side wrappers needed.
